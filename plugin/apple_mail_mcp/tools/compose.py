@@ -17,6 +17,12 @@ from apple_mail_mcp.core import (
     run_applescript,
     inbox_mailbox_script,
 )
+from apple_mail_mcp.smtp_send import (
+    has_smtp_credentials,
+    send_via_smtp,
+    save_draft_via_imap,
+    reply_via_smtp,
+)
 
 
 def _split_addresses(value):
@@ -473,13 +479,14 @@ def reply_to_email(
     reply_to_all: bool = False,
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
-    send: bool = True,
+    send: bool = False,
     mode: Optional[str] = None,
     attachments: Optional[str] = None,
     body_html: Optional[str] = None,
 ) -> str:
     """
-    Reply to an email matching a subject keyword.
+    Reply to an email matching a subject keyword. Defaults to saving as a draft —
+    callers must explicitly opt in to dispatch immediately.
 
     Args:
         account: Account name (e.g., "Gmail", "Work")
@@ -488,14 +495,45 @@ def reply_to_email(
         reply_to_all: If True, reply to all recipients; if False, reply only to sender (default: False)
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
-        send: If True (default), send immediately; if False, save as draft. Ignored if mode is set.
-        mode: Delivery mode — "send" (send immediately), "draft" (save silently), or "open" (open compose window for review). Overrides send parameter when set.
+        send: If True, send immediately; if False (default), save as draft. Ignored if mode is set.
+        mode: Delivery mode — "draft" (save silently, default behavior when send=False), "send" (send immediately), or "open" (open compose window for review). Overrides send parameter when set.
         attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the reply is pasted as HTML. The plain 'reply_body' field is still required as fallback text.
 
     Returns:
         Confirmation message with details of the reply sent, saved draft, or opened draft
     """
+
+    # --- Server-direct path (preferred): reliable IMAP/SMTP, no Mail.app GUI ---
+    # Mirrors a real Reply / Reply-All: correct recipients, quoted original,
+    # threading headers. Only "send"/"draft" (not "open", which needs the UI) and
+    # plain-text replies; HTML replies fall through to the GUI path below. Any
+    # failure also falls through, so the legacy path stays as a safety net.
+    _effective_mode = (
+        mode if mode in ("send", "draft", "open") else ("send" if send else "draft")
+    )
+    if _effective_mode in ("send", "draft") and not body_html:
+        _sender_email = _resolve_sender_address(account)
+        if _sender_email and has_smtp_credentials(account, _sender_email):
+            _validated = None
+            if attachments:
+                _validated, _err = _validate_attachment_paths(attachments)
+                if _err:
+                    return _err
+            _ok, _msg = reply_via_smtp(
+                account=account,
+                sender_email=_sender_email,
+                subject_keyword=subject_keyword,
+                reply_body=reply_body,
+                reply_to_all=reply_to_all,
+                mode=_effective_mode,
+                cc=cc,
+                bcc=bcc,
+                attachments=_validated or None,
+            )
+            if _ok:
+                return _msg
+            # else: fall through to the legacy GUI path below
 
     # Escape all user inputs for AppleScript
     safe_account = escape_applescript(account)
@@ -618,11 +656,15 @@ def reply_to_email(
         success_text = "Reply opened in Mail for review. Edit and send when ready."
     else:  # draft
         header_text = "SAVING REPLY AS DRAFT"
+        # Explicit save first, then close. The previous `close window 1 saving yes`
+        # raced with the async clipboard-paste and surfaced the "Save as draft?"
+        # dialog interactively. `save replyMessage` is deterministic, and once
+        # there are no unsaved changes, `close window 1` exits silently.
         post_paste_action = """
+                delay 0.8
+                save replyMessage
                 delay 0.5
-                tell application "Mail"
-                    close window 1 saving yes
-                end tell"""
+                close window 1"""
         success_text = "Reply saved as draft!"
 
     cleanup_script = f'do shell script "rm -f " & quoted form of "{body_temp_path}"'
@@ -781,11 +823,12 @@ def compose_email(
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
     attachments: Optional[str] = None,
-    mode: str = "send",
+    mode: str = "draft",
     body_html: Optional[str] = None,
 ) -> str:
     """
-    Compose and send a new email from a specific account.
+    Compose an email from a specific account. Defaults to saving as a draft —
+    callers must explicitly pass mode="send" to dispatch immediately.
 
     Args:
         account: Account name to send from (e.g., "Gmail", "Work", "Personal")
@@ -795,7 +838,7 @@ def compose_email(
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
         attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
-        mode: Delivery mode — "send" (send immediately, default), "draft" (save silently to Drafts), or "open" (open compose window for review before sending)
+        mode: Delivery mode — "draft" (save silently to Drafts, default; safe for AI-initiated sends), "send" (send immediately, requires explicit opt-in), or "open" (open compose window for review before sending)
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the email is sent as HTML. The plain 'body' field is still required as fallback text.
 
     Returns:
@@ -809,6 +852,7 @@ def compose_email(
     # Validate and resolve attachments early
     attachment_script = ""
     attachment_info = ""
+    validated_paths: List[str] = []
     if attachments:
         validated_paths, error = _validate_attachment_paths(attachments)
         if error:
@@ -821,6 +865,39 @@ def compose_email(
                 delay 1
             '''
             attachment_info += f"  {path}\n"
+
+    # --- SMTP / IMAP path (preferred when credentials are available) ---
+    # Bypasses Mail.app's compose editor, which injects share-wrapper HTML and
+    # explicit colors that break nested-quote rendering on iOS. Only kicks in
+    # for "send" and "draft" modes — "open" requires Mail's UI by definition.
+    if mode in ("send", "draft"):
+        sender_email = _resolve_sender_address(account)
+        if sender_email and has_smtp_credentials(account, sender_email):
+            if mode == "send":
+                ok, msg = send_via_smtp(
+                    account=account,
+                    sender_email=sender_email,
+                    to=to,
+                    subject=subject,
+                    plain=body,
+                    html=body_html,
+                    cc=cc,
+                    bcc=bcc,
+                    attachments=validated_paths or None,
+                )
+            else:  # draft
+                ok, msg = save_draft_via_imap(
+                    account=account,
+                    sender_email=sender_email,
+                    to=to,
+                    subject=subject,
+                    plain=body,
+                    html=body_html,
+                    cc=cc,
+                    bcc=bcc,
+                    attachments=validated_paths or None,
+                )
+            return msg if ok else f"Error: {msg}"
 
     # --- HTML path: use NSPasteboard clipboard injection ---
     if body_html:
@@ -968,9 +1045,11 @@ def forward_email(
     mailbox: str = "INBOX",
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
+    mode: str = "draft",
 ) -> str:
     """
-    Forward an email to one or more recipients.
+    Forward an email to one or more recipients. Defaults to saving as a draft —
+    callers must explicitly pass mode="send" to dispatch immediately.
 
     Args:
         account: Account name (e.g., "Gmail", "Work")
@@ -980,10 +1059,15 @@ def forward_email(
         mailbox: Mailbox to search in (default: "INBOX")
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
+        mode: Delivery mode — "draft" (save silently to Drafts, default), "send" (send immediately, requires explicit opt-in), or "open" (leave compose window open for review)
 
     Returns:
         Confirmation message with details of forwarded email
     """
+
+    # Validate mode
+    if mode not in ("send", "draft", "open"):
+        return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
 
     # Escape all user inputs for AppleScript
     safe_account = escape_applescript(account)
@@ -1076,6 +1160,22 @@ use framework "AppKit"
 use scripting additions
 """
 
+    # Dispatch per mode: send immediately, save as draft, or leave open
+    if mode == "send":
+        fwd_dispatch_script = "send forwardMessage"
+        fwd_success_text = "Email forwarded successfully."
+    elif mode == "draft":
+        fwd_dispatch_script = (
+            "delay 0.5\n"
+            "                save forwardMessage\n"
+            "                delay 0.3\n"
+            "                close window 1"
+        )
+        fwd_success_text = "Forward saved as draft."
+    else:  # open
+        fwd_dispatch_script = "-- leaving forward window open for review"
+        fwd_success_text = "Forward opened in Mail for review. Edit and send when ready."
+
     script = f'''{use_frameworks}
 tell application "Mail"
     set outputText to "FORWARDING EMAIL" & return & return
@@ -1131,13 +1231,13 @@ tell application "Mail"
             -- Add optional message via HTML clipboard paste (preserves forwarded content)
             {fwd_html_paste_script}
 
-            -- Send the forward
-            send forwardMessage
+            -- Dispatch per mode: send | save draft | leave open
+            {fwd_dispatch_script}
 
             -- Clean up temp files
             {fwd_html_cleanup_script}
 
-            set outputText to outputText & "Email forwarded successfully." & return
+            set outputText to outputText & "{fwd_success_text}" & return
             set outputText to outputText & "To: {safe_to}" & return
             set outputText to outputText & "Subject: " & messageSubject & return
     '''
@@ -1256,6 +1356,24 @@ def manage_drafts(
     elif action == "create":
         if not subject or not to or not body:
             return "Error: 'subject', 'to', and 'body' are required for creating drafts"
+
+        # Prefer IMAP draft path when credentials exist (bypasses Mail's
+        # compose editor and the share-wrapper bug). Falls through to the
+        # AppleScript path otherwise.
+        sender_email = _resolve_sender_address(account)
+        if sender_email and has_smtp_credentials(account, sender_email):
+            ok, msg = save_draft_via_imap(
+                account=account,
+                sender_email=sender_email,
+                to=to,
+                subject=subject,
+                plain=body,
+                html=None,
+                cc=cc,
+                bcc=bcc,
+                attachments=None,
+            )
+            return msg if ok else f"Error: {msg}"
 
         escaped_subject = escape_applescript(subject)
         escaped_body = escape_applescript(body)

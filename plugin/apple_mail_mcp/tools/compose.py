@@ -18,6 +18,7 @@ from apple_mail_mcp.core import (
     inbox_mailbox_script,
 )
 from apple_mail_mcp.smtp_send import (
+    ACCOUNT_CONFIG,
     has_smtp_credentials,
     send_via_smtp,
     save_draft_via_imap,
@@ -46,6 +47,52 @@ def _default_rich_draft_path(subject):
     return drafts_dir / (_safe_eml_name(subject) + ".eml")
 
 
+def _account_default_alias_if_single(account):
+    """Return the sole alias of `account` when it has exactly one configured
+    email address, else None. Used when no explicit sender is requested so
+    that single-address accounts still send from their own alias rather than
+    Mail's global "Send new messages from" preference.
+    """
+    safe_account = escape_applescript(account)
+    script = f'''
+    tell application "Mail"
+        try
+            set targetAccount to account "{safe_account}"
+            set emailAddrs to email addresses of targetAccount
+            if (count of emailAddrs) is 1 then
+                return item 1 of emailAddrs
+            end if
+            return ""
+        on error
+            return ""
+        end try
+    end tell
+    '''
+    result = (run_applescript(script) or "").strip()
+    return result or None
+
+
+def _compose_sender_script(variable, account_ref, sender_override):
+    """Return AppleScript that sets the sender for a compose/reply/forward
+    outgoing message variable, respecting Mail's account-level defaults.
+
+    With `sender_override` the value is applied unconditionally. Without an
+    override, Mail's global composing preference may otherwise win over the
+    caller's account choice, so the sender is pinned to the account's only
+    alias when the account has a single address, and left untouched for
+    multi-alias accounts so the user's Mail preference stays in effect.
+    """
+    if sender_override:
+        safe_sender = escape_applescript(sender_override)
+        return f'set sender of {variable} to "{safe_sender}"'
+    return (
+        f"set emailAddrs to email addresses of {account_ref}\n"
+        f"if (count of emailAddrs) is 1 then\n"
+        f"    set sender of {variable} to item 1 of emailAddrs\n"
+        f"end if"
+    )
+
+
 def _resolve_sender_address(account):
     """Return the primary sender address for a Mail account, if available."""
     safe_account = escape_applescript(account)
@@ -68,6 +115,68 @@ def _resolve_sender_address(account):
     return sender_address or None
 
 
+def _validate_from_address(account, from_address):
+    """Return (validated_address, error_message) for a sender override.
+
+    When `from_address` is blank the override is skipped and both values
+    are None. Otherwise the candidate is matched case-insensitively
+    against the account's configured email addresses, and the original
+    casing from Mail is returned on success.
+    """
+    if from_address is None:
+        return None, None
+    candidate = from_address.strip()
+    if not candidate:
+        return None, None
+    safe_account = escape_applescript(account)
+    script = f'''
+    tell application "Mail"
+        try
+            set targetAccount to account "{safe_account}"
+            set emailAddrs to email addresses of targetAccount
+            set AppleScript's text item delimiters to linefeed
+            set addrText to emailAddrs as text
+            set AppleScript's text item delimiters to ""
+            return addrText
+        on error
+            return ""
+        end try
+    end tell
+    '''
+    raw = run_applescript(script) or ""
+    aliases = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not aliases:
+        return None, (
+            f"Error: Could not read email addresses for account {account!r}."
+        )
+    lowered = {alias.lower(): alias for alias in aliases}
+    match = lowered.get(candidate.lower())
+    if not match:
+        return None, (
+            f"Error: 'from_address' {candidate!r} is not configured on account "
+            f"{account!r}. Known addresses: {', '.join(aliases)}"
+        )
+    return match, None
+
+
+_CDATA_BLOCK_PATTERN = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
+
+
+def _strip_cdata_wrappers(text):
+    """Remove XML CDATA section markers from user-provided body content.
+
+    LLM callers occasionally wrap email bodies in `<![CDATA[...]]>`. HTML
+    parsers treat the opening `<![CDATA[` as a bogus comment that ends at
+    the first `>` in the actual content, so it's invisible — but the
+    trailing `]]>` has no preceding `<` and renders as literal text at the
+    end of the message. Strip both forms so callers don't have to know.
+    """
+    if not text:
+        return text
+    text = _CDATA_BLOCK_PATTERN.sub(r"\1", text)
+    return text.replace("<![CDATA[", "").replace("]]>", "")
+
+
 def _build_html_from_text(text_body):
     """Return a simple HTML wrapper for plain text content."""
     safe_body = html_escape(text_body or "")
@@ -78,6 +187,52 @@ def _build_html_from_text(text_body):
         + safe_body
         + "</pre></body></html>"
     )
+
+
+def _html_to_pasteboard_script(html_temp_path, pb_var="pb", old_clip_var="oldClip"):
+    """Return an AppleScriptObjC snippet that loads HTML and places it on the
+    general pasteboard as RICH TEXT (RTF) plus a plain-text fallback.
+
+    Why RTF and not raw HTML: writing the HTML *source* under
+    ``NSPasteboardTypeHTML`` (the previous approach) leaves Mail's compose
+    editor with only an ambiguous ``public.html`` flavor and no plain-text
+    representation. For anything other than a complete, well-formed HTML
+    document Mail renders a best-effort version AND surfaces the literal
+    markup, so the recipient sees the message twice — once rendered, once as
+    raw ``<p>``/``<b>`` source. Converting the HTML to an
+    ``NSAttributedString`` and writing it back as RTF gives Mail a single,
+    unambiguous rich-text flavor it pastes deterministically as one rendered
+    body; the accompanying plain-text flavor is the *rendered* text (tags
+    stripped), so even a plain-text fallback never shows markup.
+
+    The snippet stores the prior clipboard string in ``old_clip_var`` so the
+    caller can restore it, and reads the HTML from ``html_temp_path`` (written
+    by the Python caller to avoid AppleScript string-escaping issues).
+    """
+    return f"""set htmlString to do shell script "cat '{html_temp_path}'"
+set {pb_var} to current application's NSPasteboard's generalPasteboard()
+set {old_clip_var} to {pb_var}'s stringForType:(current application's NSPasteboardTypeString)
+set htmlNSStr to current application's NSString's stringWithString:htmlString
+set htmlBytes to htmlNSStr's dataUsingEncoding:(current application's NSUTF8StringEncoding)
+-- Pin the HTML importer to UTF-8. Without NSCharacterEncodingDocumentAttribute the
+-- Cocoa HTML reader auto-detects the charset and defaults to Latin-1/Windows-1252,
+-- so the UTF-8 bytes for ä/ö/ü/ß/emoji get double-decoded into mojibake
+-- (e.g. "Grüße" -> "GrÃ¼ÃŸe"). Passing NSUTF8StringEncoding fixes all multibyte text.
+set htmlOptKeys to {{current application's NSDocumentTypeDocumentAttribute, current application's NSCharacterEncodingDocumentAttribute}}
+set htmlOptVals to {{current application's NSHTMLTextDocumentType, current application's NSUTF8StringEncoding}}
+set htmlOpts to current application's NSDictionary's dictionaryWithObjects:htmlOptVals forKeys:htmlOptKeys
+set attrStr to current application's NSAttributedString's alloc()'s initWithData:htmlBytes options:htmlOpts documentAttributes:(missing value) |error|:(missing value)
+{pb_var}'s clearContents()
+if attrStr is not missing value then
+    set attrRange to current application's NSMakeRange(0, attrStr's |length|())
+    set rtfData to attrStr's RTFFromRange:attrRange documentAttributes:(current application's NSDictionary's dictionary())
+    {pb_var}'s setData:rtfData forType:(current application's NSPasteboardTypeRTF)
+    {pb_var}'s setString:(attrStr's |string|()) forType:(current application's NSPasteboardTypeString)
+else
+    -- Conversion failed (malformed HTML): fall back to pasting the raw string
+    -- as plain text so the body is never silently empty.
+    {pb_var}'s setString:htmlString forType:(current application's NSPasteboardTypeString)
+end if"""
 
 
 def _prepare_rich_bodies(subject, text_body, html_body):
@@ -151,6 +306,7 @@ def create_rich_email_draft(
     output_path: Optional[str] = None,
     open_in_mail: bool = True,
     save_as_draft: bool = False,
+    from_address: Optional[str] = None,
 ) -> str:
     """
     Create a rich-text email draft by generating an unsent `.eml` message and optionally opening it in Mail.
@@ -169,12 +325,22 @@ def create_rich_email_draft(
         output_path: Optional path for the generated `.eml` file
         open_in_mail: If True, open the generated `.eml` in Mail (default: True)
         save_as_draft: If True, ask Mail to save the opened compose window into Drafts (default: False)
+        from_address: Optional sender address to stamp into the `.eml` `From:` header. Must be one of the account's configured email addresses. When omitted, Mail fills the account's default "Send new messages from" address on open.
 
     Returns:
         Confirmation with the generated `.eml` path, missing details, and Mail-open/save status
     """
     if not account or not account.strip():
         return "Error: 'account' is required"
+
+    text_body = _strip_cdata_wrappers(text_body)
+    html_body = _strip_cdata_wrappers(html_body)
+
+    sender_override, sender_error = _validate_from_address(account, from_address)
+    if sender_error:
+        return sender_error
+
+    sender_address = sender_override or _account_default_alias_if_single(account)
 
     recipients_to = _split_addresses(to)
     recipients_cc = _split_addresses(cc)
@@ -190,7 +356,6 @@ def create_rich_email_draft(
         missing_details.append("to")
     missing_details.extend(body_missing)
 
-    sender_address = _resolve_sender_address(account)
     message = EmailMessage()
     if subject:
         message["Subject"] = subject
@@ -256,7 +421,9 @@ def _send_html_email(
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
     attachments_script: str = "",
+    attachment_info: str = "",
     mode: str = "send",
+    sender_override: Optional[str] = None,
 ) -> str:
     """Send an HTML-formatted email via NSPasteboard clipboard injection.
 
@@ -281,6 +448,10 @@ def _send_html_email(
     if bcc:
         for addr in [a.strip() for a in bcc.split(",") if a.strip()]:
             bcc_lines += f'make new bcc recipient at end of bcc recipients with properties {{address:"{escape_applescript(addr)}"}}\n'
+
+    sender_script = _compose_sender_script(
+        "newMsg", f'account "{safe_account}"', sender_override
+    )
 
     # Mode-specific behaviour after paste
     if mode == "send":
@@ -315,33 +486,40 @@ def _send_html_email(
     tmp.close()
     html_temp_path = tmp.name
 
+    # Build the attachments block. Must run AFTER the HTML paste so that
+    # Cmd+A in the body doesn't select-and-replace the attachment placeholder.
+    # Empty block when no attachments — keeps AppleScript valid either way.
+    if attachments_script.strip():
+        attachments_block = (
+            'tell application "Mail"\n'
+            '    tell newMsg\n'
+            f'        {attachments_script}\n'
+            '    end tell\n'
+            'end tell'
+        )
+    else:
+        attachments_block = "-- (no attachments)"
+
     script = f'''
 use framework "Foundation"
 use framework "AppKit"
 use scripting additions
 
--- Step 1: Read HTML from temp file and place on clipboard
-set htmlString to do shell script "cat '{html_temp_path}'"
-set pb to current application's NSPasteboard's generalPasteboard()
+-- Step 1: Read HTML from temp file and place it on the clipboard as RTF
+-- (rendered rich text) plus a plain-text fallback. Writing the raw HTML
+-- *source* under NSPasteboardTypeHTML made Mail paste the markup twice —
+-- once rendered, once as literal tags; the RTF conversion fixes that.
+{_html_to_pasteboard_script(html_temp_path)}
 
--- Save current clipboard for restoration
-set oldClip to pb's stringForType:(current application's NSPasteboardTypeString)
-
-pb's clearContents()
-set htmlData to (current application's NSString's stringWithString:htmlString)'s dataUsingEncoding:(current application's NSUTF8StringEncoding)
-pb's setData:htmlData forType:(current application's NSPasteboardTypeHTML)
-
--- Step 2: Create compose window (empty body so signature doesn't interfere)
+-- Step 2: Create compose window (empty body so signature doesn't interfere).
+-- Attachments are deliberately NOT added here — see Step 4b for why.
 tell application "Mail"
     set newMsg to make new outgoing message with properties {{subject:"{escaped_subject}", content:"", visible:true}}
-    set emailAddrs to email addresses of account "{safe_account}"
-    set senderAddress to item 1 of emailAddrs
-    set sender of newMsg to senderAddress
+    {sender_script}
     tell newMsg
         {to_lines}
         {cc_lines}
         {bcc_lines}
-        {attachments_script}
     end tell
     activate
 end tell
@@ -349,9 +527,21 @@ end tell
 -- Step 3: Wait for compose window to render
 delay 2.5
 
--- Step 4: Tab from header fields into body, then paste
+-- Step 4a: Tab from header fields into body, then paste HTML.
+-- The Cmd+A here selects the entire body (which is why we can't have the
+-- attachment placed yet — it would be selected and replaced by the paste).
 tell application "System Events"
-    set frontmost of process "Mail" to true
+    -- Poll until Mail is genuinely frontmost before driving the keyboard.
+    -- A single `set frontmost` + fixed delay can fire the tab/paste keystrokes
+    -- before the compose window has focus, producing a silent empty send.
+    set focusWaited to 0
+    repeat until (frontmost of process "Mail") or (focusWaited is greater than or equal to 40)
+        try
+            set frontmost of process "Mail" to true
+        end try
+        delay 0.1
+        set focusWaited to focusWaited + 1
+    end repeat
     delay 0.5
     tell process "Mail"
         -- Tab through: To -> Cc -> Bcc -> Subject -> Body
@@ -367,7 +557,15 @@ tell application "System Events"
         delay 0.2
         keystroke "v" using command down
         delay 0.5
+    end tell
+end tell
 
+-- Step 4b: Attach files AFTER the HTML paste so they aren't clobbered by Cmd+A.
+{attachments_block}
+
+-- Step 4c: Final action (send / save draft / leave open)
+tell application "System Events"
+    tell process "Mail"
         {post_paste_script}
     end tell
 end tell
@@ -401,6 +599,8 @@ return "{success_text}"
             confirm += f"\nCC: {cc}"
         if bcc:
             confirm += f"\nBCC: {bcc}"
+        if attachment_info:
+            confirm += f"\nAttachments:\n{attachment_info.rstrip()}"
         return confirm
     except subprocess.TimeoutExpired:
         return "Error: HTML email script timed out"
@@ -483,6 +683,7 @@ def reply_to_email(
     mode: Optional[str] = None,
     attachments: Optional[str] = None,
     body_html: Optional[str] = None,
+    from_address: Optional[str] = None,
 ) -> str:
     """
     Reply to an email matching a subject keyword. Defaults to saving as a draft —
@@ -499,10 +700,19 @@ def reply_to_email(
         mode: Delivery mode — "draft" (save silently, default behavior when send=False), "send" (send immediately), or "open" (open compose window for review). Overrides send parameter when set.
         attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the reply is pasted as HTML. The plain 'reply_body' field is still required as fallback text.
+        from_address: Optional sender address to use for this reply. Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
 
     Returns:
         Confirmation message with details of the reply sent, saved draft, or opened draft
     """
+
+    # Upstream input hygiene, runs for both the server-direct and GUI paths.
+    reply_body = _strip_cdata_wrappers(reply_body) or ""
+    body_html = _strip_cdata_wrappers(body_html)
+
+    sender_override, sender_error = _validate_from_address(account, from_address)
+    if sender_error:
+        return sender_error
 
     # --- Server-direct path (preferred): reliable IMAP/SMTP, no Mail.app GUI ---
     # Mirrors a real Reply / Reply-All: correct recipients, quoted original,
@@ -513,7 +723,11 @@ def reply_to_email(
         mode if mode in ("send", "draft", "open") else ("send" if send else "draft")
     )
     if _effective_mode in ("send", "draft") and not body_html:
-        _sender_email = _resolve_sender_address(account)
+        _sender_email = (
+            (sender_override or _resolve_sender_address(account))
+            if account in ACCOUNT_CONFIG
+            else None
+        )
         if _sender_email and has_smtp_credentials(account, _sender_email):
             _validated = None
             if attachments:
@@ -670,18 +884,19 @@ def reply_to_email(
     cleanup_script = f'do shell script "rm -f " & quoted form of "{body_temp_path}"'
     html_cleanup_script = f'do shell script "rm -f \'{html_temp_path}\'"'
 
+    sender_script = _compose_sender_script(
+        "replyMessage", "targetAccount", sender_override
+    )
+
     script = f'''
 use framework "Foundation"
 use framework "AppKit"
 use scripting additions
 
--- Step 1: Place reply body HTML on clipboard via NSPasteboard
-set htmlString to do shell script "cat '{html_temp_path}'"
-set pb to current application's NSPasteboard's generalPasteboard()
-set oldClip to pb's stringForType:(current application's NSPasteboardTypeString)
-pb's clearContents()
-set htmlData to (current application's NSString's stringWithString:htmlString)'s dataUsingEncoding:(current application's NSUTF8StringEncoding)
-pb's setData:htmlData forType:(current application's NSPasteboardTypeHTML)
+-- Step 1: Place the reply body on the clipboard as RTF (rendered rich text)
+-- plus a plain-text fallback. The previous raw-HTML-source approach made
+-- Mail paste the body twice (rendered + literal tags); RTF pastes once.
+{_html_to_pasteboard_script(html_temp_path)}
 
 -- Step 2: Find the email and create reply
 tell application "Mail"
@@ -717,24 +932,47 @@ tell application "Mail"
             {reply_command}
             delay 0.5
 
-            -- Ensure the reply is from the correct account
-            set emailAddrs to email addresses of targetAccount
-            set senderAddress to item 1 of emailAddrs
-            set sender of replyMessage to senderAddress
+            {sender_script}
 
             -- Add CC/BCC recipients
             {cc_script}
             {bcc_script}
 
-            -- Add attachments
-            {attachment_script}
+            -- Add attachments (must be scoped to replyMessage so `last paragraph` resolves;
+            -- bare `make new attachment ... at after the last paragraph` inside `tell application "Mail"`
+            -- raises "Can't get last paragraph" because the reference has no implicit owner)
+            tell replyMessage
+                {attachment_script}
+            end tell
 
-            -- Paste reply body (HTML already on clipboard from Step 1)
+            -- Paste reply body (HTML already on clipboard from Step 1).
+            -- The body is inserted via a blind Cmd+V into the compose window, so the
+            -- window MUST have keyboard focus when the keystroke fires. If Mail is not
+            -- frontmost at that moment (common on the first compose of a session, when
+            -- another app holds focus, or when the machine is busy), the paste lands
+            -- nowhere and an EMPTY reply is sent with no error returned.
+            --
+            -- We deliberately do NOT verify the paste by reading `content of
+            -- replyMessage` afterwards: Mail's GUI editor buffer is decoupled from the
+            -- scriptable `content` property, so reading it always returns the pre-paste
+            -- value (verified empirically — it reports 0 chars even after a successful
+            -- paste). A content-read-back guard would therefore false-fail every send.
+            -- Instead we make the paste deterministic by polling until Mail is genuinely
+            -- frontmost (re-asserting focus each iteration) before issuing the keystroke.
             set visible of replyMessage to true
             activate
-            delay 1.5
 
             tell application "System Events"
+                set focusWaited to 0
+                repeat until (frontmost of process "Mail") or (focusWaited is greater than or equal to 40)
+                    try
+                        set frontmost of process "Mail" to true
+                    end try
+                    delay 0.1
+                    set focusWaited to focusWaited + 1
+                end repeat
+                -- settle delay so the compose window's body holds keyboard focus
+                delay 0.8
                 tell process "Mail"
                     keystroke "v" using command down
                 end tell
@@ -825,6 +1063,7 @@ def compose_email(
     attachments: Optional[str] = None,
     mode: str = "draft",
     body_html: Optional[str] = None,
+    from_address: Optional[str] = None,
 ) -> str:
     """
     Compose an email from a specific account. Defaults to saving as a draft —
@@ -840,6 +1079,7 @@ def compose_email(
         attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
         mode: Delivery mode — "draft" (save silently to Drafts, default; safe for AI-initiated sends), "send" (send immediately, requires explicit opt-in), or "open" (open compose window for review before sending)
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the email is sent as HTML. The plain 'body' field is still required as fallback text.
+        from_address: Optional sender address to use for this message. Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
 
     Returns:
         Confirmation message with details of the email
@@ -848,6 +1088,14 @@ def compose_email(
     # Validate mode
     if mode not in ("send", "draft", "open"):
         return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
+
+    body = _strip_cdata_wrappers(body) or ""
+    body_html = _strip_cdata_wrappers(body_html)
+
+    # Validate optional sender override
+    sender_override, sender_error = _validate_from_address(account, from_address)
+    if sender_error:
+        return sender_error
 
     # Validate and resolve attachments early
     attachment_script = ""
@@ -871,7 +1119,9 @@ def compose_email(
     # explicit colors that break nested-quote rendering on iOS. Only kicks in
     # for "send" and "draft" modes — "open" requires Mail's UI by definition.
     if mode in ("send", "draft"):
-        sender_email = _resolve_sender_address(account)
+        sender_email = (
+            _resolve_sender_address(account) if account in ACCOUNT_CONFIG else None
+        )
         if sender_email and has_smtp_credentials(account, sender_email):
             if mode == "send":
                 ok, msg = send_via_smtp(
@@ -910,7 +1160,9 @@ def compose_email(
             cc=cc,
             bcc=bcc,
             attachments_script=attachment_script,
+            attachment_info=attachment_info,
             mode=mode,
+            sender_override=sender_override,
         )
 
     # --- Plain-text path: existing AppleScript approach ---
@@ -954,6 +1206,10 @@ def compose_email(
         escape_applescript(attachment_info) if attachment_info else ""
     )
 
+    sender_script = _compose_sender_script(
+        "newMessage", "targetAccount", sender_override
+    )
+
     # Determine behavior per mode
     if mode == "send":
         header_text = "COMPOSING EMAIL"
@@ -981,10 +1237,7 @@ def compose_email(
             -- Create new outgoing message
             set newMessage to make new outgoing message with properties {{subject:"{escaped_subject}", content:"{escaped_body}", visible:{visible}}}
 
-            -- Set the sender account
-            set emailAddrs to email addresses of targetAccount
-            set senderAddress to item 1 of emailAddrs
-            set sender of newMessage to senderAddress
+            {sender_script}
 
             -- Add TO/CC/BCC recipients
             tell newMessage
@@ -1046,6 +1299,7 @@ def forward_email(
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
     mode: str = "draft",
+    from_address: Optional[str] = None,
 ) -> str:
     """
     Forward an email to one or more recipients. Defaults to saving as a draft —
@@ -1060,6 +1314,7 @@ def forward_email(
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
         mode: Delivery mode — "draft" (save silently to Drafts, default), "send" (send immediately, requires explicit opt-in), or "open" (leave compose window open for review)
+        from_address: Optional sender address to use when forwarding. Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
 
     Returns:
         Confirmation message with details of forwarded email
@@ -1069,12 +1324,22 @@ def forward_email(
     if mode not in ("send", "draft", "open"):
         return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
 
+    message = _strip_cdata_wrappers(message)
+
+    sender_override, sender_error = _validate_from_address(account, from_address)
+    if sender_error:
+        return sender_error
+
     # Escape all user inputs for AppleScript
     safe_account = escape_applescript(account)
     safe_subject_keyword = escape_applescript(subject_keyword)
     safe_to = escape_applescript(to)
     safe_mailbox = escape_applescript(mailbox)
     escaped_message = escape_applescript(message) if message else ""
+
+    sender_script = _compose_sender_script(
+        "forwardMessage", "targetAccount", sender_override
+    )
 
     # Build CC recipients if provided
     cc_script = ""
@@ -1133,12 +1398,10 @@ def forward_email(
                 activate
                 delay 1.5
 
-                set htmlString to do shell script "cat '{fwd_html_temp_path}'"
-                set pb to current application's NSPasteboard's generalPasteboard()
-                set oldClip to pb's stringForType:(current application's NSPasteboardTypeString)
-                pb's clearContents()
-                set htmlData to (current application's NSString's stringWithString:htmlString)'s dataUsingEncoding:(current application's NSUTF8StringEncoding)
-                pb's setData:htmlData forType:(current application's NSPasteboardTypeHTML)
+                -- Place the prepended note on the clipboard as RTF (rendered)
+                -- plus a plain-text fallback, instead of raw HTML source which
+                -- Mail would paste twice (rendered + literal tags).
+                {_html_to_pasteboard_script(fwd_html_temp_path)}
 
                 tell application "System Events"
                     tell process "Mail"
@@ -1216,10 +1479,7 @@ tell application "Mail"
             -- Create forward
             set forwardMessage to forward foundMessage with opening window
 
-            -- Set sender account
-            set emailAddrs to email addresses of targetAccount
-            set senderAddress to item 1 of emailAddrs
-            set sender of forwardMessage to senderAddress
+            {sender_script}
 
             -- Add recipients
             {to_script}
@@ -1301,6 +1561,7 @@ def manage_drafts(
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
     draft_subject: Optional[str] = None,
+    from_address: Optional[str] = None,
 ) -> str:
     """
     Manage draft emails - list, create, send, open, or delete drafts.
@@ -1314,10 +1575,13 @@ def manage_drafts(
         cc: Optional CC recipients for create
         bcc: Optional BCC recipients for create
         draft_subject: Subject keyword to find draft (required for send/open/delete)
+        from_address: Optional sender address for new drafts (action="create"). Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
 
     Returns:
         Formatted output based on action
     """
+
+    body = _strip_cdata_wrappers(body)
 
     # Escape account for all paths
     safe_account = escape_applescript(account)
@@ -1357,10 +1621,18 @@ def manage_drafts(
         if not subject or not to or not body:
             return "Error: 'subject', 'to', and 'body' are required for creating drafts"
 
+        sender_override, sender_error = _validate_from_address(account, from_address)
+        if sender_error:
+            return sender_error
+
         # Prefer IMAP draft path when credentials exist (bypasses Mail's
         # compose editor and the share-wrapper bug). Falls through to the
         # AppleScript path otherwise.
-        sender_email = _resolve_sender_address(account)
+        sender_email = (
+            (sender_override or _resolve_sender_address(account))
+            if account in ACCOUNT_CONFIG
+            else None
+        )
         if sender_email and has_smtp_credentials(account, sender_email):
             ok, msg = save_draft_via_imap(
                 account=account,
@@ -1378,6 +1650,10 @@ def manage_drafts(
         escaped_subject = escape_applescript(subject)
         escaped_body = escape_applescript(body)
         safe_to = escape_applescript(to)
+
+        sender_script = _compose_sender_script(
+            "newDraft", "targetAccount", sender_override
+        )
 
         # Build TO recipients (split comma-separated)
         to_script = ""
@@ -1418,10 +1694,7 @@ def manage_drafts(
                 -- Create new outgoing message (draft)
                 set newDraft to make new outgoing message with properties {{subject:"{escaped_subject}", content:"{escaped_body}", visible:false}}
 
-                -- Set the sender account
-                set emailAddrs to email addresses of targetAccount
-                set senderAddress to item 1 of emailAddrs
-                set sender of newDraft to senderAddress
+                {sender_script}
 
                 -- Add recipients
                 tell newDraft

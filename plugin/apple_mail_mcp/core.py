@@ -1,9 +1,127 @@
 """Core helpers: AppleScript execution, escaping, parsing, and preference injection."""
 
+import atexit
+import re
+import signal
 import subprocess
+import threading
 from typing import Optional, List, Dict, Any, Tuple
 
 from apple_mail_mcp.server import USER_PREFERENCES
+
+
+# ---------------------------------------------------------------------------
+# In-flight osascript child tracking
+# ---------------------------------------------------------------------------
+# All live Popen objects for in-flight osascript calls.  Guarded by
+# _inflight_lock so callers on any thread can safely add/remove entries.
+_inflight_children: set = set()
+_inflight_lock = threading.Lock()
+
+# Sentinel so we only register atexit + signal handlers once.
+_cleanup_registered = False
+_cleanup_lock = threading.Lock()
+
+
+def _kill_inflight_children() -> None:
+    """Kill every in-flight osascript child that is still alive.
+
+    Called from atexit and chained signal handlers so that graceful
+    SIGTERM/SIGHUP/normal-exit paths do not leave orphaned osascript
+    processes behind.  The AppleScript-level ``with timeout`` block (see
+    _apply_applescript_timeout) is the safety net for SIGKILL / os._exit,
+    where these handlers never run.
+    """
+    with _inflight_lock:
+        procs = list(_inflight_children)
+    for proc in procs:
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+
+
+def _register_cleanup_once() -> None:
+    """Register atexit and SIGTERM/SIGHUP handlers exactly once, thread-safely.
+
+    Signal handlers may only be set from the main thread; the try/except
+    guards against ImportError or ValueError when called from a worker thread
+    so that module import never crashes in non-main-thread contexts.
+    """
+    global _cleanup_registered
+    with _cleanup_lock:
+        if _cleanup_registered:
+            return
+        _cleanup_registered = True
+
+    atexit.register(_kill_inflight_children)
+
+    # Chain onto any previously installed signal handlers rather than
+    # clobbering them (e.g. FastMCP installs its own SIGTERM handler).
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            old_handler = signal.getsignal(sig)
+
+            def _make_handler(old, signum_capture=sig):
+                def _handler(signum, frame):
+                    _kill_inflight_children()
+                    if callable(old) and old not in (
+                        signal.SIG_DFL,
+                        signal.SIG_IGN,
+                    ):
+                        old(signum, frame)
+                return _handler
+
+            signal.signal(sig, _make_handler(old_handler))
+        except (ValueError, OSError):
+            # Not on the main thread or signal not available — skip silently.
+            pass
+
+
+def _popen_factory(*args, **kwargs) -> subprocess.Popen:
+    """Thin wrapper around subprocess.Popen; injectable for unit tests."""
+    return subprocess.Popen(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# AppleScript timeout injection
+# ---------------------------------------------------------------------------
+
+
+# Handler definitions ("on name(...)" / "to name(...)") are only legal at the
+# top level of an AppleScript — never inside a block.  "on error" is a try
+# clause, not a handler definition, so it must not trigger the guard.
+_HANDLER_DEFINITION_RE = re.compile(r"^\s*(?:on|to)\s+(?!error\b)\w+", re.MULTILINE)
+
+
+def _apply_applescript_timeout(script: str, timeout: int) -> str:
+    """Wrap *script* in an AppleScript ``with timeout`` block.
+
+    The inner timeout is ``max(timeout - 5, 5)`` seconds, giving the
+    AppleScript interpreter a chance to exit cleanly before the Python-side
+    ``communicate(timeout=…)`` fires.
+
+    Two classes of script cannot legally be nested inside a block and are
+    returned unchanged:
+
+    * scripts with a top-level ``use`` declaration (e.g. ASObjC
+      ``use framework "Foundation"`` in compose.py);
+    * scripts that define handlers (``on name(...)`` / ``to name(...)``) —
+      handler definitions are only legal at the top level, so wrapping them
+      fails with 'Expected "end" but found "on"' (-2741, issue #63).  These
+      scripts keep their own inner ``with timeout`` blocks, and the
+      Python-side ``communicate(timeout=…)`` kill still covers them.
+
+    Nested ``with timeout`` blocks are legal in AppleScript, so this wrap is
+    compatible with per-tool timeouts already present in manage.py / search.py.
+    """
+    if any(line.lstrip().startswith("use ") for line in script.splitlines()):
+        return script
+    if _HANDLER_DEFINITION_RE.search(script):
+        return script
+    inner = max(timeout - 5, 5)
+    return f"with timeout of {inner} seconds\n{script}\nend timeout"
 
 
 def inject_preferences(func):
@@ -51,24 +169,56 @@ def _sanitize_for_json(text: str) -> str:
 
 
 def run_applescript(script: str, timeout: int = 120) -> str:
-    """Execute AppleScript via stdin pipe for reliable multi-line handling."""
+    """Execute AppleScript via stdin pipe for reliable multi-line handling.
+
+    Two-layer defence against orphaned osascript children (issue #58):
+
+    1. The script is wrapped in an AppleScript ``with timeout`` block so the
+       interpreter self-terminates even when the parent process is SIGKILLed
+       or exits via os._exit() (e.g. the orphan-watcher in __main__.py).
+
+    2. The live Popen object is tracked in ``_inflight_children``.  An atexit
+       handler and chained SIGTERM/SIGHUP handlers call kill() on any survivors
+       so graceful-exit paths also clean up.
+    """
+    # Ensure signal/atexit handlers are registered (idempotent, main-thread only).
+    _register_cleanup_once()
+
+    # Inject an AppleScript-level timeout so the child self-terminates even if
+    # the Python process is killed before communicate() can enforce its timeout.
+    wrapped = _apply_applescript_timeout(script, timeout)
+
+    proc = _popen_factory(
+        ["osascript", "-"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    with _inflight_lock:
+        _inflight_children.add(proc)
+
     try:
-        result = subprocess.run(
-            ["osascript", "-"],
-            input=script.encode("utf-8"),
-            capture_output=True,
-            timeout=timeout,
+        stdout, stderr = proc.communicate(
+            input=wrapped.encode("utf-8"), timeout=timeout
         )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            if stderr:
-                raise Exception(f"AppleScript error: {stderr}")
-        output = result.stdout.decode("utf-8", errors="replace").strip()
-        return _sanitize_for_json(output)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
         raise Exception("AppleScript execution timed out")
     except Exception as e:
         raise Exception(f"AppleScript execution failed: {str(e)}")
+    finally:
+        with _inflight_lock:
+            _inflight_children.discard(proc)
+
+    if proc.returncode != 0:
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            raise Exception(f"AppleScript error: {stderr_text}")
+
+    output = stdout.decode("utf-8", errors="replace").strip()
+    return _sanitize_for_json(output)
 
 
 def normalize_search_terms(
@@ -182,16 +332,47 @@ LOWERCASE_HANDLER = """
 """
 
 
+# Localized inbox mailbox names. Mail.app uses the system locale to name
+# the inbox folder for non-IMAP accounts (Exchange, on-my-Mac), so we must
+# try multiple names to find it. IMAP accounts (iCloud, Gmail) typically
+# expose 'INBOX' regardless of system language.
+INBOX_NAMES = [
+    "INBOX",                  # IMAP standard (iCloud, Gmail, Fastmail)
+    "Inbox",                  # English non-IMAP
+    "Boîte de réception",     # French (Exchange/Outlook on FR system)
+    "Boîte aux lettres",      # French alt
+    "Réception",              # French alt
+    "Posteingang",            # German
+    "Bandeja de entrada",     # Spanish
+    "Posta in arrivo",        # Italian
+    "Caixa de entrada",       # Portuguese
+    "Postvak IN",             # Dutch
+    "受信トレイ",             # Japanese
+]
+
+
 def inbox_mailbox_script(
     var_name: str = "inboxMailbox", account_var: str = "anAccount"
 ) -> str:
-    """Return AppleScript snippet to get inbox mailbox with INBOX/Inbox fallback."""
+    """Return AppleScript snippet to resolve the inbox mailbox.
+
+    Iterates through INBOX_NAMES (localized variants) so non-English
+    Mail.app accounts — typically Exchange on a French/German/etc.
+    system where the inbox is 'Boîte de réception' / 'Posteingang' —
+    still resolve correctly.
+    """
+    name_list = ", ".join(f'"{n}"' for n in INBOX_NAMES)
     return f"""
-                try
-                    set {var_name} to mailbox "INBOX" of {account_var}
-                on error
-                    set {var_name} to mailbox "Inbox" of {account_var}
-                end try"""
+                set {var_name} to missing value
+                repeat with __inboxLookupName in {{{name_list}}}
+                    try
+                        set {var_name} to mailbox (__inboxLookupName as string) of {account_var}
+                        exit repeat
+                    end try
+                end repeat
+                if {var_name} is missing value then
+                    error "No inbox mailbox found for account " & (name of {account_var})
+                end if"""
 
 
 def content_preview_script(max_length: int, output_var: str = "outputText") -> str:
@@ -233,6 +414,36 @@ def skip_folders_condition(var_name: str = "mailboxName") -> str:
     return f"{var_name} is not in {{{folder_list}}}"
 
 
+def resolve_flag_color(flag_color: str) -> int:
+    """Map a flag color name to Mail's `flag index` value (0-6).
+
+    Raises ValueError for colors outside Mail's seven indexed flags.
+    """
+    from apple_mail_mcp.constants import FLAG_COLORS
+
+    flag_index = FLAG_COLORS.get(flag_color.strip().lower())
+    if flag_index is None:
+        valid = ", ".join(c for c in FLAG_COLORS if c != "grey")
+        raise ValueError(f"Invalid flag_color '{flag_color}'. Use: {valid}")
+    return flag_index
+
+
+def read_flag_index_script(var_name: str = "messageFlagIndex") -> str:
+    """Return AppleScript snippet reading a message's flag index into var_name.
+
+    The variable defaults to -1 (unflagged) when the property is unreadable.
+    `flag index` and `flagged status` are independent properties in Mail —
+    unflagging only clears the boolean, leaving a residual index — so the
+    read is gated on `flagged status` to treat such messages as unflagged.
+    """
+    return f"""set {var_name} to -1
+                                                try
+                                                    if flagged status of aMessage then
+                                                        set {var_name} to flag index of aMessage
+                                                    end if
+                                                end try"""
+
+
 def build_mailbox_ref(
     mailbox: str,
     account_var: str = "targetAccount",
@@ -257,6 +468,21 @@ def build_mailbox_ref(
             ref += f'mailbox "{escape_applescript(parts[i])}" of '
         ref += account_var
         return f"set {var_name} to {ref}"
+
+    # When caller asks for "INBOX" (default for most tools), iterate the
+    # localized fallback list so Exchange/non-English inboxes are found.
+    if mailbox.upper() == "INBOX":
+        name_list = ", ".join(f'"{n}"' for n in INBOX_NAMES)
+        return f'''set {var_name} to missing value
+            repeat with __mailboxLookupName in {{{name_list}}}
+                try
+                    set {var_name} to mailbox (__mailboxLookupName as string) of {account_var}
+                    exit repeat
+                end try
+            end repeat
+            if {var_name} is missing value then
+                error "Mailbox not found: {escaped} (no localized inbox match)"
+            end if'''
 
     return f'''try
                 set {var_name} to mailbox "{escaped}" of {account_var}

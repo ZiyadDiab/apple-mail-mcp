@@ -72,7 +72,7 @@ claude mcp add apple-mail -- mcp-apple-mail
 <details>
 <summary><strong>Claude Desktop MCPB</strong></summary>
 
-1. Download `apple-mail-mcp-v2.2.0.mcpb` from [Releases](https://github.com/patrickfreyer/apple-mail-mcp/releases)
+1. Download the latest `apple-mail-mcp-vX.Y.Z.mcpb` from [Releases](https://github.com/patrickfreyer/apple-mail-mcp/releases)
 2. Open Claude Desktop → Settings → Developer → MCP Servers → Install from file
 3. Select the `.mcpb` file and grant Mail.app permissions
 
@@ -101,7 +101,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `list_inbox_emails` | List emails with account/read-status filtering and optional content preview |
 | `get_mailbox_unread_counts` | Unread counts per mailbox or per-account summary |
 | `list_accounts` | List all configured Mail accounts |
-| `search_emails` | Unified search — subject, sender, body text, dates, attachments, cross-account |
+| `search_emails` | Unified search — subject, sender, body text, dates, attachments, flag status/color, cross-account |
 | `get_email_thread` | Conversation thread view |
 
 ### Organization
@@ -110,7 +110,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `list_mailboxes` | Folder hierarchy with message counts |
 | `create_mailbox` | Create new mailboxes (supports nested paths) |
 | `move_email` | Move/archive emails with filters (subject, sender, date, read status, dry-run) |
-| `update_email_status` | Mark read/unread, flag/unflag — by filters or message IDs |
+| `update_email_status` | Mark read/unread, flag/unflag (optional flag color) — by filters or message IDs |
 | `manage_trash` | Soft delete, permanent delete, empty trash (with dry-run) |
 
 ### Composition
@@ -265,6 +265,21 @@ apple-mail-mcp/
 2. Create a feature branch (`git checkout -b feature/my-feature`)
 3. Commit and push
 4. Open a Pull Request
+
+## Releasing
+
+Follow these steps when cutting a new release to keep all version strings in sync:
+
+1. Bump `__version__` in `plugin/apple_mail_mcp/__init__.py` to the new version.
+2. Update `apple-mail-mcpb/manifest.json` (`"version"` field) to match.
+3. Update `pyproject.toml` (`version = ...` under `[project]`) to match.
+4. Update both version fields in `server.json` (`"version"` and `"packages"[0]["version"]`) to match.
+5. Run `python3 scripts/check_versions.py` — it must print **OK** before you proceed.
+6. Commit, tag, and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+7. Create a GitHub release from the tag.
+8. Build and publish to PyPI: `python -m build && twine upload dist/*` (requires PyPI credentials).
+
+> The test suite also enforces version consistency (`tests/test_version_consistency.py`), so any CI run on a branch with mismatched versions will fail fast.
 
 ## License
 

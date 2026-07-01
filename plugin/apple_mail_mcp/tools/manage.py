@@ -5,6 +5,7 @@ from typing import Optional, List
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
+    resolve_flag_color,
     contains_any_condition,
     equals_any_numeric_condition,
     inject_preferences,
@@ -31,6 +32,7 @@ def move_email(
     older_than_days: Optional[int] = None,
     dry_run: bool = False,
     only_read: bool = False,
+    message_ids: Optional[List[str]] = None,
 ) -> str:
     """
     Move email(s) matching filters from one mailbox to another.
@@ -38,6 +40,8 @@ def move_email(
     Supports subject, sender, and date filters. Use dry_run=True to preview
     matches without moving. Set only_read=True to skip unread emails (useful
     for archiving). For archiving to "Archive", just set to_mailbox="Archive".
+    Pass message_ids to move specific messages by exact id (ignores other
+    filters; same fast path as update_email_status).
 
     Args:
         account: Account name (e.g., "Gmail", "Work")
@@ -50,21 +54,91 @@ def move_email(
         older_than_days: Optional age filter - only move emails older than N days
         dry_run: If True, preview what would be moved without acting (default: False)
         only_read: If True, only move emails that have been read (default: False)
+        message_ids: Optional list of exact Mail message ids for precise targeting. When set, all other filters are ignored.
 
     Returns:
         Confirmation message with details of moved emails
     """
 
+    safe_account = escape_applescript(account)
+    safe_from = escape_applescript(from_mailbox)
+    safe_to = escape_applescript(to_mailbox)
+
+    # Destination mailbox reference — built once and reused by both the
+    # filter-based path and the id-based fast path below.
+    mailbox_parts = to_mailbox.split("/")
+    if len(mailbox_parts) > 1:
+        dest_ref = f'mailbox "{escape_applescript(mailbox_parts[-1])}" of '
+        for i in range(len(mailbox_parts) - 2, -1, -1):
+            dest_ref += f'mailbox "{escape_applescript(mailbox_parts[i])}" of '
+        dest_ref += "targetAccount"
+    else:
+        dest_ref = f'mailbox "{safe_to}" of targetAccount'
+
+    # --- ID-based fast path: ignore subject/sender/date filters entirely.
+    # Mirrors the message_ids branch in update_email_status so callers
+    # who already know the message id (e.g. an inbox app's "archive"
+    # button) don't have to round-trip through subject filtering.
+    if message_ids is not None:
+        normalized_ids = normalize_message_ids(message_ids)
+        if not normalized_ids:
+            return "Error: 'message_ids' must contain one or more numeric Mail ids"
+
+        id_condition = equals_any_numeric_condition("id", normalized_ids)
+        mode_label = "DRY RUN - PREVIEW MOVE BY IDS" if dry_run else "MOVING EMAILS BY IDS"
+        move_action = "" if dry_run else "move aMessage to destMailbox"
+        result_prefix = "Would move" if dry_run else "Moved"
+
+        script = f'''
+        tell application "Mail"
+            with timeout of 300 seconds
+                set outputText to "{mode_label}: {safe_from} -> {safe_to}" & return & return
+                set moveCount to 0
+
+                try
+                    set targetAccount to account "{safe_account}"
+                    {build_mailbox_ref(from_mailbox, var_name="sourceMailbox")}
+                    set destMailbox to {dest_ref}
+
+                    set targetMessages to every message of sourceMailbox whose {id_condition}
+                    set requestedCount to {len(normalized_ids)}
+
+                    repeat with aMessage in targetMessages
+                        try
+                            set messageSubject to subject of aMessage
+                            set messageSender to sender of aMessage
+                            set messageDate to date received of aMessage
+
+                            {move_action}
+
+                            set outputText to outputText & "{result_prefix}: " & messageSubject & return
+                            set outputText to outputText & "   From: " & messageSender & return
+                            set outputText to outputText & "   Date: " & (messageDate as string) & return & return
+
+                            set moveCount to moveCount + 1
+                        end try
+                    end repeat
+
+                    set outputText to outputText & "========================================" & return
+                    set outputText to outputText & "REQUESTED: " & requestedCount & " id(s), MATCHED: " & moveCount & return
+                    set outputText to outputText & "========================================" & return
+
+                on error errMsg
+                    return "Error: " & errMsg
+                end try
+
+                return outputText
+            end timeout
+        end tell
+        '''
+        return run_applescript(script, timeout=300)
+
     subject_terms = normalize_search_terms(subject_keyword, subject_keywords)
     if not subject_terms and not sender and not older_than_days:
         return (
             "Error: At least one filter is required (subject_keyword, sender, "
-            "or older_than_days). This prevents accidentally moving everything."
+            "older_than_days, or message_ids). This prevents accidentally moving everything."
         )
-
-    safe_account = escape_applescript(account)
-    safe_from = escape_applescript(from_mailbox)
-    safe_to = escape_applescript(to_mailbox)
 
     # Build filter condition for the loop body (uses local vars)
     condition_str = build_filter_condition(
@@ -95,15 +169,8 @@ def move_email(
         date_setup = f"set cutoffDate to (current date) - ({older_than_days} * days)"
         date_cond = " and messageDate < cutoffDate"
 
-    # Build nested mailbox reference for destination
-    mailbox_parts = to_mailbox.split("/")
-    if len(mailbox_parts) > 1:
-        dest_ref = f'mailbox "{escape_applescript(mailbox_parts[-1])}" of '
-        for i in range(len(mailbox_parts) - 2, -1, -1):
-            dest_ref += f'mailbox "{escape_applescript(mailbox_parts[i])}" of '
-        dest_ref += "targetAccount"
-    else:
-        dest_ref = f'mailbox "{safe_to}" of targetAccount'
+    # dest_ref already computed at the top of the function (shared with
+    # the id-based fast path).
 
     if dry_run:
         mode_label = "DRY RUN - PREVIEW MOVE"
@@ -298,6 +365,7 @@ def update_email_status(
     apply_to_all: bool = False,
     message_ids: Optional[List[str]] = None,
     older_than_days: Optional[int] = None,
+    flag_color: Optional[str] = None,
 ) -> str:
     """
     Update email status - mark as read/unread or flag/unflag emails.
@@ -316,12 +384,27 @@ def update_email_status(
         apply_to_all: Must be True to allow updates without any filter
         message_ids: Optional list of exact Mail message ids for precise targeting
         older_than_days: Optional age filter - only update emails older than N days
+        flag_color: Optional flag color for the "flag" action: "red", "orange",
+            "yellow", "green", "blue", "purple", or "gray". Omit to flag
+            without setting a color — Mail shows its default (red), or the
+            message's previous color if one remains from an earlier flag.
+            Re-colors messages that are already flagged.
 
     Returns:
         Confirmation message with details of updated emails
     """
 
     safe_account = escape_applescript(account)
+
+    flag_index: Optional[int] = None
+    if flag_color is not None:
+        if action != "flag":
+            return "Error: 'flag_color' is only valid with action='flag'"
+        flag_color = flag_color.strip().lower()
+        try:
+            flag_index = resolve_flag_color(flag_color)
+        except ValueError as exc:
+            return f"Error: {exc}"
 
     # Build action scripts
     if action == "mark_read":
@@ -333,9 +416,22 @@ def update_email_status(
         single_action_script = "set read status of aMessage to false"
         action_label = "Marked as unread"
     elif action == "flag":
-        bulk_action_script = "set flagged status of targetMessages to true"
-        single_action_script = "set flagged status of aMessage to true"
-        action_label = "Flagged"
+        if flag_index is not None:
+            # flag index and flagged status are independent properties; set
+            # both so coloring an unflagged message activates the flag.
+            bulk_action_script = (
+                f"set flag index of targetMessages to {flag_index}\n"
+                "                            set flagged status of targetMessages to true"
+            )
+            single_action_script = (
+                f"set flag index of aMessage to {flag_index}\n"
+                "                            set flagged status of aMessage to true"
+            )
+            action_label = f"Flagged ({flag_color})"
+        else:
+            bulk_action_script = "set flagged status of targetMessages to true"
+            single_action_script = "set flagged status of aMessage to true"
+            action_label = "Flagged"
     elif action == "unflag":
         bulk_action_script = "set flagged status of targetMessages to false"
         single_action_script = "set flagged status of aMessage to false"
@@ -422,7 +518,15 @@ def update_email_status(
     elif action == "mark_unread":
         conditions = ["read status is true"]
     elif action == "flag":
-        conditions = ["flagged status is false"]
+        if flag_index is not None:
+            # Match unflagged messages AND already-flagged ones needing a
+            # re-color; also match a residual matching index whose flag is
+            # inactive (flag index survives unflagging).
+            conditions = [
+                f"(flag index is not {flag_index} or flagged status is false)"
+            ]
+        else:
+            conditions = ["flagged status is false"]
     else:  # unflag
         conditions = ["flagged status is true"]
 
@@ -850,3 +954,99 @@ def create_mailbox(
     return run_applescript(script)
 
 
+
+
+@mcp.tool()
+@inject_preferences
+def synchronize_account(account: Optional[str] = None) -> str:
+    """
+    Force Mail.app to synchronize an account (or every account) with its
+    IMAP / Exchange server right now. Equivalent to clicking the
+    refresh button next to the account or selecting Mailbox → Synchronize.
+
+    Use after `move_email`, `update_email_status`, or `manage_trash`
+    when downstream clients (iPhone, web mail, etc.) need to see the
+    change immediately. Mail.app's natural sync cadence is "automatic"
+    which can be several minutes — this collapses that to one IMAP push.
+
+    Implementation note:
+    --------------------
+    Uses the `synchronize with <account>` AppleScript verb (per Mail.sdef:
+    "Command to trigger synchronizing of an IMAP account with the server")
+    rather than `check for new mail`. The latter is receive-only — it
+    pulls new messages but does NOT push pending IMAP commands like
+    queued moves / archives / flag changes. With `check for new mail`,
+    archives done via `move_email` could sit in Mail.app's local cache
+    for several minutes before reaching the IMAP server, leaving iPhone
+    Mail (which reads IMAP directly) showing already-archived messages
+    still in INBOX. `synchronize with` is the bidirectional verb that
+    drains pending IMAP commands AND fetches new mail.
+
+    Mail.app's synchronize is potentially long-running. We wrap each
+    invocation in `with timeout of N seconds` so the AppleScript returns
+    promptly. When the timeout fires (error -1712) Mail.app keeps the
+    sync running in the background — exactly the fire-and-forget
+    semantics callers expect.
+
+    Args:
+        account: Account name (e.g., "Gmail", "Work"). Omit to sync every
+                 configured account.
+
+    Returns:
+        Confirmation string with the account(s) synced or queued.
+    """
+    # 8 s is comfortably longer than a healthy IMAP sync but short enough
+    # that a stuck account / network blip doesn't block the MCP call. On
+    # timeout we report "queued" — the sync continues asynchronously.
+    PER_ACCOUNT_TIMEOUT_S = 8
+
+    if account is None or not account.strip():
+        script = f'''
+        tell application "Mail"
+            set acctNames to {{}}
+            set queuedNames to {{}}
+            repeat with a in accounts
+                set acctName to name of a
+                set end of acctNames to acctName
+                try
+                    with timeout of {PER_ACCOUNT_TIMEOUT_S} seconds
+                        synchronize with a
+                    end timeout
+                on error errMsg number errNum
+                    if errNum is -1712 then
+                        set end of queuedNames to acctName
+                    end if
+                end try
+            end repeat
+            set AppleScript's text item delimiters to ", "
+            if (count of queuedNames) > 0 then
+                return "Synchronized all accounts: " & (acctNames as string) & " (queued: " & (queuedNames as string) & ")"
+            else
+                return "Synchronized all accounts: " & (acctNames as string)
+            end if
+        end tell
+        '''
+        return run_applescript(script)
+
+    acct_escaped = escape_applescript(account.strip())
+    script = f'''
+    tell application "Mail"
+        try
+            set targetAccount to first account whose name is "{acct_escaped}"
+            try
+                with timeout of {PER_ACCOUNT_TIMEOUT_S} seconds
+                    synchronize with targetAccount
+                end timeout
+                return "Synchronized: {acct_escaped}"
+            on error errMsg number errNum
+                if errNum is -1712 then
+                    return "Synchronizing: {acct_escaped} (queued — push in progress)"
+                end if
+                return "Error: " & errMsg
+            end try
+        on error errMsg
+            return "Error: " & errMsg
+        end try
+    end tell
+    '''
+    return run_applescript(script)

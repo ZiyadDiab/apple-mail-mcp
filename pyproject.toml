@@ -37,6 +37,8 @@ classifiers = [
 ]
 dependencies = [
     "fastmcp>=3.1.0",
+    # mcp 2.x hat mcp.server.fastmcp entfernt; server.py braucht noch v1.
+    "mcp<2",
 ]
 
 [project.scripts]

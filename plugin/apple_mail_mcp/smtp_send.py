@@ -8,7 +8,9 @@ get full control over what hits the wire.
 Credentials live in the macOS Keychain. Look up by:
     security find-generic-password -s "apple-mail-mcp/<account>" -a <email> -w
 
-Currently only iCloud is supported. Add to ACCOUNT_CONFIG below to extend.
+Works for every IMAP account in Mail: server, ports and folders are read from
+Mail and the IMAP server itself (account_config). ACCOUNT_CONFIG holds only
+overrides. Exchange/Microsoft accounts (no IMAP in Mail) keep the editor path.
 """
 
 import email as email_mod
@@ -40,6 +42,65 @@ ACCOUNT_CONFIG = {
         "drafts_folder": "Drafts",
     },
 }
+
+
+# Hosts whose servers file mail sent via SMTP into Sent by themselves; an own
+# APPEND there would show every mail twice.
+_SERVER_SAVES_SENT = ("gmail.com", "googlemail.com", "office365.com", "outlook.com")
+
+_AUTO_CONFIG_CACHE: dict = {}
+
+
+def _read_mail_servers(account: str) -> Optional[dict]:
+    """IMAP and SMTP server of a Mail account, read from Mail itself."""
+    from .core import escape_applescript, run_applescript
+
+    safe = escape_applescript(account)
+    script = f'''
+    tell application "Mail"
+        set a to account "{safe}"
+        if (account type of a as string) is not "imap" then return "kein-imap"
+        set s to smtp server of a
+        return (server name of a) & "|" & (port of a) & "|" & (server name of s) & "|" & (port of s)
+    end tell
+    '''
+    try:
+        out = run_applescript(script, timeout=20).strip()
+    except Exception:  # noqa: BLE001
+        return None
+    teile = out.split("|")
+    if len(teile) != 4 or not all(teile):
+        return None
+    imap_host, imap_port, smtp_host, smtp_port = teile
+    try:
+        imap_port_i, smtp_port_i = int(imap_port), int(smtp_port)
+    except ValueError:
+        return None
+    return {
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port_i,
+        # 465 is implicit TLS, 587/25 upgrade with STARTTLS
+        "smtp_use_ssl": smtp_port_i == 465,
+        "smtp_use_starttls": smtp_port_i != 465,
+        "imap_host": imap_host,
+        "imap_port": imap_port_i,
+        "drafts_folder": None,  # SPECIAL-USE \\Drafts
+        "sent_folder": None,    # SPECIAL-USE \\Sent
+        "server_saves_sent": smtp_host.lower().endswith(_SERVER_SAVES_SENT),
+    }
+
+
+def account_config(account: str) -> Optional[dict]:
+    """Server config for an account: override from ACCOUNT_CONFIG, else from Mail.
+
+    None means: no IMAP account (for example Exchange), so the caller keeps
+    using Mail's compose editor.
+    """
+    if account in ACCOUNT_CONFIG:
+        return ACCOUNT_CONFIG[account]
+    if account not in _AUTO_CONFIG_CACHE:
+        _AUTO_CONFIG_CACHE[account] = _read_mail_servers(account)
+    return _AUTO_CONFIG_CACHE[account]
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +139,7 @@ def _get_keychain_password(account: str, email_address: str) -> Optional[str]:
 
 def has_smtp_credentials(account: str, email_address: str) -> bool:
     """True if both an account config and a Keychain password exist."""
-    if account not in ACCOUNT_CONFIG:
+    if account_config(account) is None:
         return False
     return _get_keychain_password(account, email_address) is not None
 
@@ -181,7 +242,8 @@ def _smtp_send(
     config: dict, username: str, password: str, msg: EmailMessage
 ) -> None:
     """Send via SMTP. Raises on failure."""
-    with smtplib.SMTP(config["smtp_host"], config["smtp_port"], timeout=30) as smtp:
+    klasse = smtplib.SMTP_SSL if config.get("smtp_use_ssl") else smtplib.SMTP
+    with klasse(config["smtp_host"], config["smtp_port"], timeout=30) as smtp:
         smtp.ehlo()
         if config.get("smtp_use_starttls"):
             smtp.starttls()
@@ -191,6 +253,35 @@ def _smtp_send(
         smtp.send_message(msg)
 
 
+def _special_use_folder(imap, flag: str) -> Optional[str]:
+    """Name of the mailbox that carries a SPECIAL-USE flag (RFC 6154), or None.
+
+    The name is returned exactly as the server lists it (modified UTF-7),
+    which is what APPEND expects.
+    """
+    typ, data = imap.list()
+    if typ != "OK":
+        return None
+    return _parse_special_use(data or [], flag)
+
+
+def _parse_special_use(lines, flag: str) -> Optional[str]:
+    """Pick the mailbox name with *flag* out of raw IMAP LIST lines."""
+    pattern = re.compile(r'^\((?P<flags>[^)]*)\) (?:"[^"]*"|NIL) (?P<name>.+)$')
+    wanted = flag.lower()
+    for raw in lines:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        if wanted in (f.lower() for f in m.group("flags").split()):
+            name = m.group("name").strip()
+            if name.startswith('"') and name.endswith('"'):
+                name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+            return name
+    return None
+
+
 def _imap_append(
     config: dict,
     username: str,
@@ -198,17 +289,25 @@ def _imap_append(
     folder: str,
     flags: str,
     msg: EmailMessage,
+    special_use: str = "\\Drafts",
 ) -> None:
     """Append message to IMAP folder. Raises on failure.
+
+    With folder None the mailbox carrying *special_use* is used, because its
+    name depends on the server and the account language.
 
     Note: Python's imaplib.append does NOT auto-quote mailbox names that
     contain spaces or other special characters, so we wrap the name in
     double quotes ourselves. iCloud rejects unquoted multi-word names
     with a 'Parse Error' (e.g. "Sent Messages", "Deleted Messages").
     """
-    quoted_folder = f'"{folder}"' if not (folder.startswith('"') and folder.endswith('"')) else folder
     with imaplib.IMAP4_SSL(config["imap_host"], config["imap_port"]) as imap:
         imap.login(username, password)
+        if folder is None:
+            folder = _special_use_folder(imap, special_use)
+            if folder is None:
+                raise RuntimeError(f"no IMAP folder with special-use flag {special_use}")
+        quoted_folder = f'"{folder}"' if not (folder.startswith('"') and folder.endswith('"')) else folder
         status, _ = imap.append(
             quoted_folder,
             flags,
@@ -222,6 +321,10 @@ def _imap_append(
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
+
+
+class _SentHandledByServer(Exception):
+    """The server files sent mail itself; no APPEND to Sent."""
 
 
 def send_via_smtp(
@@ -242,7 +345,7 @@ def send_via_smtp(
     Returns (success, message). The message is human-readable confirmation
     or error text, suitable for returning to the MCP caller.
     """
-    if account not in ACCOUNT_CONFIG:
+    if account_config(account) is None:
         return False, f"SMTP send not configured for account: {account}"
 
     password = _get_keychain_password(account, sender_email)
@@ -254,7 +357,7 @@ def send_via_smtp(
             f"-s {_keychain_service_name(account)!r} -w",
         )
 
-    config = ACCOUNT_CONFIG[account]
+    config = account_config(account)
 
     try:
         msg = _build_message(
@@ -274,21 +377,27 @@ def send_via_smtp(
     except OSError as e:
         return False, f"Network error during SMTP send: {e}"
 
-    # 2) Append a copy to Sent (best-effort — don't fail the whole call if this fails)
+    # 2) Append a copy to Sent (best-effort — don't fail the whole call if this fails).
+    #    Servers that file sent mail themselves (Gmail, Microsoft) set server_saves_sent.
     sent_warning = ""
     try:
+        if config.get("server_saves_sent"):
+            raise _SentHandledByServer()
         _imap_append(
             config,
             sender_email,
             password,
-            config["sent_folder"],
+            config.get("sent_folder"),
             "(\\Seen)",
             msg,
+            special_use="\\Sent",
         )
+    except _SentHandledByServer:
+        pass
     except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
         sent_warning = (
             f"\n(Note: sent successfully, but couldn't archive to "
-            f"{config['sent_folder']!r}: {e}. iCloud server-side copy may still appear shortly.)"
+            f"{config.get('sent_folder') or 'Sent'!r}: {e}.)"
         )
 
     lines = [
@@ -329,7 +438,7 @@ def save_draft_via_imap(
 
     Returns (success, message).
     """
-    if account not in ACCOUNT_CONFIG:
+    if account_config(account) is None:
         return False, f"Draft-via-IMAP not configured for account: {account}"
 
     password = _get_keychain_password(account, sender_email)
@@ -341,7 +450,7 @@ def save_draft_via_imap(
             f"-s {_keychain_service_name(account)!r} -w",
         )
 
-    config = ACCOUNT_CONFIG[account]
+    config = account_config(account)
 
     try:
         msg = _build_message(
@@ -356,11 +465,11 @@ def save_draft_via_imap(
             config,
             sender_email,
             password,
-            config["drafts_folder"],
+            config.get("drafts_folder"),
             "(\\Draft)",
             msg,
         )
-    except imaplib.IMAP4.error as e:
+    except (imaplib.IMAP4.error, RuntimeError) as e:
         return False, f"IMAP error saving draft: {e}"
     except OSError as e:
         return False, f"Network error saving draft: {e}"
@@ -498,13 +607,13 @@ def reply_via_smtp(
     (recipients, quoted original, threading headers), then saves a draft
     (mode="draft") or sends (mode="send") via SMTP. Returns (success, message).
     """
-    if account not in ACCOUNT_CONFIG:
+    if account_config(account) is None:
         return False, f"Reply-via-server not configured for account: {account}"
     password = _get_keychain_password(account, sender_email)
     if not password:
         return False, f"No Keychain password for {account} ({sender_email})."
 
-    config = ACCOUNT_CONFIG[account]
+    config = account_config(account)
     try:
         with imaplib.IMAP4_SSL(config["imap_host"], config["imap_port"]) as imap:
             imap.login(sender_email, password)

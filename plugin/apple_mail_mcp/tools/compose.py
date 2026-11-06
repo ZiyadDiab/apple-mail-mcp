@@ -18,7 +18,7 @@ from apple_mail_mcp.core import (
     inbox_mailbox_script,
 )
 from apple_mail_mcp.smtp_send import (
-    ACCOUNT_CONFIG,
+    account_config,
     has_smtp_credentials,
     send_via_smtp,
     save_draft_via_imap,
@@ -725,7 +725,7 @@ def reply_to_email(
     if _effective_mode in ("send", "draft") and not body_html:
         _sender_email = (
             (sender_override or _resolve_sender_address(account))
-            if account in ACCOUNT_CONFIG
+            if account_config(account) is not None
             else None
         )
         if _sender_email and has_smtp_credentials(account, _sender_email):
@@ -1120,7 +1120,7 @@ def compose_email(
     # for "send" and "draft" modes — "open" requires Mail's UI by definition.
     if mode in ("send", "draft"):
         sender_email = (
-            _resolve_sender_address(account) if account in ACCOUNT_CONFIG else None
+            _resolve_sender_address(account) if account_config(account) is not None else None
         )
         if sender_email and has_smtp_credentials(account, sender_email):
             if mode == "send":
@@ -1630,7 +1630,7 @@ def manage_drafts(
         # AppleScript path otherwise.
         sender_email = (
             (sender_override or _resolve_sender_address(account))
-            if account in ACCOUNT_CONFIG
+            if account_config(account) is not None
             else None
         )
         if sender_email and has_smtp_credentials(account, sender_email):

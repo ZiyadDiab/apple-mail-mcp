@@ -39,6 +39,23 @@ ACCOUNT_CONFIG = {
         "sent_folder": "Sent Messages",
         "drafts_folder": "Drafts",
     },
+    # Google Workspace (Gmail-IMAP). Ohne diesen Eintrag laufen Entwürfe über
+    # Mails Compose-Editor, der den Text in einen Share-Rahmen packt; dessen
+    # oberstes <div><br></div> ist die leere erste Zeile in jedem Entwurf.
+    "zd@alpine-valley.com": {
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_use_starttls": True,
+        "imap_host": "imap.gmail.com",
+        "imap_port": 993,
+        # Gmail legt per SMTP gesendete Mails selbst unter Gesendet ab; ein
+        # eigenes APPEND ergäbe jede Mail doppelt.
+        "sent_folder": None,
+        # Der Name hängt an der Sprache des Kontos ("[Gmail]/Entwürfe",
+        # "[Gmail]/Drafts"); deshalb über SPECIAL-USE \Drafts ermitteln.
+        "drafts_folder": None,
+        "drafts_special_use": "\\Drafts",
+    },
 }
 
 
@@ -191,6 +208,35 @@ def _smtp_send(
         smtp.send_message(msg)
 
 
+def _special_use_folder(imap, flag: str) -> Optional[str]:
+    """Name of the mailbox that carries a SPECIAL-USE flag (RFC 6154), or None.
+
+    The name is returned exactly as the server lists it (modified UTF-7),
+    which is what APPEND expects.
+    """
+    typ, data = imap.list()
+    if typ != "OK":
+        return None
+    return _parse_special_use(data or [], flag)
+
+
+def _parse_special_use(lines, flag: str) -> Optional[str]:
+    """Pick the mailbox name with *flag* out of raw IMAP LIST lines."""
+    pattern = re.compile(r'^\((?P<flags>[^)]*)\) (?:"[^"]*"|NIL) (?P<name>.+)$')
+    wanted = flag.lower()
+    for raw in lines:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        if wanted in (f.lower() for f in m.group("flags").split()):
+            name = m.group("name").strip()
+            if name.startswith('"') and name.endswith('"'):
+                name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+            return name
+    return None
+
+
 def _imap_append(
     config: dict,
     username: str,
@@ -206,9 +252,14 @@ def _imap_append(
     double quotes ourselves. iCloud rejects unquoted multi-word names
     with a 'Parse Error' (e.g. "Sent Messages", "Deleted Messages").
     """
-    quoted_folder = f'"{folder}"' if not (folder.startswith('"') and folder.endswith('"')) else folder
     with imaplib.IMAP4_SSL(config["imap_host"], config["imap_port"]) as imap:
         imap.login(username, password)
+        if folder is None:
+            flag = config.get("drafts_special_use") or "\\Drafts"
+            folder = _special_use_folder(imap, flag)
+            if folder is None:
+                raise RuntimeError(f"no IMAP folder with special-use flag {flag}")
+        quoted_folder = f'"{folder}"' if not (folder.startswith('"') and folder.endswith('"')) else folder
         status, _ = imap.append(
             quoted_folder,
             flags,
@@ -222,6 +273,10 @@ def _imap_append(
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
+
+
+class _SentHandledByServer(Exception):
+    """The server files sent mail itself; no APPEND to Sent."""
 
 
 def send_via_smtp(
@@ -274,9 +329,12 @@ def send_via_smtp(
     except OSError as e:
         return False, f"Network error during SMTP send: {e}"
 
-    # 2) Append a copy to Sent (best-effort — don't fail the whole call if this fails)
+    # 2) Append a copy to Sent (best-effort — don't fail the whole call if this fails).
+    #    Accounts whose server files sent mail itself (Gmail) set sent_folder to None.
     sent_warning = ""
     try:
+        if config.get("sent_folder") is None:
+            raise _SentHandledByServer()
         _imap_append(
             config,
             sender_email,
@@ -285,6 +343,8 @@ def send_via_smtp(
             "(\\Seen)",
             msg,
         )
+    except _SentHandledByServer:
+        pass
     except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
         sent_warning = (
             f"\n(Note: sent successfully, but couldn't archive to "
@@ -356,11 +416,11 @@ def save_draft_via_imap(
             config,
             sender_email,
             password,
-            config["drafts_folder"],
+            config.get("drafts_folder"),
             "(\\Draft)",
             msg,
         )
-    except imaplib.IMAP4.error as e:
+    except (imaplib.IMAP4.error, RuntimeError) as e:
         return False, f"IMAP error saving draft: {e}"
     except OSError as e:
         return False, f"Network error saving draft: {e}"

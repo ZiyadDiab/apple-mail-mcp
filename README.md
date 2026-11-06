@@ -70,6 +70,20 @@ claude mcp add apple-mail -- mcp-apple-mail
 </details>
 
 <details>
+<summary><strong>npx skills (skill only, for Claude Code, Codex, Cursor and other agents)</strong></summary>
+
+Installs the Email Management Expert skill via the open [skills CLI](https://skills.sh). The skill does not include the MCP server, so install that too (e.g. with uvx above):
+
+```bash
+npx skills add patrickfreyer/apple-mail-mcp
+claude mcp add apple-mail -- uvx mcp-apple-mail
+```
+
+Add `-g` to install the skill globally, or `-a <agent>` to target a specific agent.
+
+</details>
+
+<details>
 <summary><strong>Claude Desktop MCPB</strong></summary>
 
 1. Download the latest `apple-mail-mcp-vX.Y.Z.mcpb` from [Releases](https://github.com/patrickfreyer/apple-mail-mcp/releases)
@@ -92,7 +106,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 
 </details>
 
-## Tools (22)
+## Tools (23)
 
 ### Reading & Search
 | Tool | Description |
@@ -102,6 +116,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `get_mailbox_unread_counts` | Unread counts per mailbox or per-account summary |
 | `list_accounts` | List all configured Mail accounts |
 | `search_emails` | Unified search — subject, sender, body text, dates, attachments, flag status/color, cross-account |
+| `read_email` | Read one message by numeric id — headers, capped plain-text body and attachment metadata (text or JSON) |
 | `get_email_thread` | Conversation thread view |
 
 ### Organization
@@ -146,7 +161,9 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 
 ### Read-Only Mode
 
-Pass `--read-only` to disable tools that send email (`compose_email`, `reply_to_email`, `forward_email`). Draft management remains available (list, create, delete) but sending a draft via `manage_drafts` is blocked.
+Pass `--read-only` to block delivery. Nothing leaves the machine: `compose_email` and `reply_to_email` refuse `mode="send"`, `manage_drafts` refuses `action="send"`, and `forward_email` is removed entirely because it has no non-sending mode.
+
+The composing tools stay registered so that `mode="draft"` and `mode="open"` keep working. Those never deliver anything, and they are the only place in the compose surface that supports `attachments` — `manage_drafts` and `create_rich_email_draft` cannot attach files.
 
 ```json
 {
@@ -191,6 +208,30 @@ Batch operations have conservative defaults to prevent accidental bulk actions:
 
 Override via function parameters when needed.
 
+### File Access
+
+By default the server can write and attach files anywhere your user account can, except a hardened denylist of locations an attacker could use for code execution or credential theft. (Attachment bytes come from whoever emailed you, and a prompt-injected email can steer tool arguments.)
+
+**Writes** (`save_email_attachment`, `export_emails`, `create_rich_email_draft`'s `output_path`) are refused for:
+
+- any dotfile or dot-folder directly in your home folder: shell startup files (`~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`), `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config` (incl. `~/.config/git`), `~/.gitconfig`, `~/.netrc`, `~/.envrc`, `~/.local/bin`, ...
+- `.git/hooks`, `.git/config` and `.envrc` in any folder
+- autostart, persistence and app-config folders: `~/Library/LaunchAgents`, `~/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`, `~/Library/Application Support` (incl. `com.apple.backgroundtaskmanagementagent`), `~/Library/Application Scripts`, `~/Library/Preferences`, `~/Library/Keychains`, `~/Library/Mail`, `~/Library/Containers`, ...
+- folders on `PATH`: `~/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, and `/etc`
+
+**Attachments** (`compose_email`, `reply_to_email`, ...) may be any readable file except secrets: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `.env` files, `~/Library/Keychains`, and browser profiles and cookie stores (Safari, Chrome, Firefox, Edge, Brave, Arc, ...).
+
+Paths are resolved (`~`, `..`, symlinks) before checking, and matching is case-insensitive like APFS.
+
+**Restricting further (opt-in).** To confine writes or attachments to specific folders, list them (colon-separated) in the server's `env`, or pass `--write-dir` / `--attach-dir` (repeatable) as arguments. Once set, only those folders are allowed for that side, and the denylist still applies inside them. The tool's own cache (`~/Library/Caches/apple-mail-mcp`, the default rich-draft location) stays writable.
+
+```json
+"env": {
+  "APPLE_MAIL_MCP_WRITE_DIRS": "~/Downloads:~/Documents/mail-exports",
+  "APPLE_MAIL_MCP_ATTACH_DIRS": "~/Documents:~/Desktop"
+}
+```
+
 ## Usage Examples
 
 ```
@@ -215,7 +256,7 @@ This is more reliable than injecting raw HTML into AppleScript `content`, which 
 
 ## Email Management Skill
 
-A companion [Claude Code Skill](plugin/skills/email-management/) is included that teaches Claude expert email workflows (Inbox Zero, daily triage, folder organization). When installed as a plugin, the skill is loaded automatically. For standalone MCP installs, copy it manually:
+A companion [Claude Code Skill](plugin/skills/email-management/) is included that teaches Claude expert email workflows (Inbox Zero, daily triage, folder organization). When installed as a plugin, the skill is loaded automatically. For standalone MCP installs, add it with `npx skills add patrickfreyer/apple-mail-mcp` or copy it manually:
 
 ```bash
 cp -r plugin/skills/email-management ~/.claude/skills/email-management
@@ -248,8 +289,7 @@ apple-mail-mcp/
 ├── plugin/                    # Claude Code plugin
 │   ├── .claude-plugin/
 │   │   └── plugin.json        # Plugin manifest
-│   ├── commands/              # /email-management slash command
-│   ├── skills/                # Email Management Expert skill
+│   ├── skills/                # Email Management Expert skill (also invocable as /email-management)
 │   ├── apple_mail_mcp/        # Python MCP server package (24 tools)
 │   ├── apple_mail_mcp.py      # Entry point
 │   ├── start_mcp.sh           # Startup wrapper (auto-creates venv)

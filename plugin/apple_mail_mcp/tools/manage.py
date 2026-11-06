@@ -1,9 +1,9 @@
 """Management tools: moving, status updates, trash, and attachments."""
 
-import os
 from typing import Optional, List
 
 from apple_mail_mcp.server import mcp
+from apple_mail_mcp.paths import validate_write_path
 from apple_mail_mcp.core import (
     resolve_flag_color,
     contains_any_condition,
@@ -13,7 +13,6 @@ from apple_mail_mcp.core import (
     normalize_message_ids,
     normalize_search_terms,
     run_applescript,
-    inbox_mailbox_script,
     build_mailbox_ref,
     build_filter_condition,
 )
@@ -134,7 +133,10 @@ def move_email(
         return run_applescript(script, timeout=300)
 
     subject_terms = normalize_search_terms(subject_keyword, subject_keywords)
-    if not subject_terms and not sender and not older_than_days:
+    # Only a positive age adds a date condition below, so only a positive age
+    # counts as a filter (same rule as update_email_status and manage_trash).
+    has_age_filter = older_than_days is not None and older_than_days > 0
+    if not subject_terms and not sender and not has_age_filter:
         return (
             "Error: At least one filter is required (subject_keyword, sender, "
             "older_than_days, or message_ids). This prevents accidentally moving everything."
@@ -242,57 +244,53 @@ def move_email(
 @mcp.tool()
 @inject_preferences
 def save_email_attachment(
-    account: str, subject_keyword: str, attachment_name: str, save_path: str
+    account: str,
+    subject_keyword: str = "",
+    attachment_name: str = "",
+    save_path: str = "",
+    mailbox: str = "INBOX",
+    message_id: Optional[str] = None,
 ) -> str:
     """
     Save a specific attachment from an email to disk.
 
     Args:
         account: Account name (e.g., "Gmail", "Work", "Personal")
-        subject_keyword: Keyword to search for in email subjects
+        subject_keyword: Keyword to search for in email subjects (ignored with message_id)
+        message_id: Numeric internal Mail id returned by search_emails
         attachment_name: Name of the attachment to save
-        save_path: Full path where to save the attachment
+        save_path: Full path where to save the attachment. Protected locations
+            (shell startup and dotfiles in ~, .git/hooks, LaunchAgents,
+            ~/Library/Application Support, ...) are rejected; see "File Access"
+            in the README for opt-in restriction to specific folders.
+        mailbox: Mailbox to search in (default: "INBOX"). Use e.g. "Archive" for an already archived message; nested mailboxes use "/".
 
     Returns:
         Confirmation message with save location
     """
 
-    # Expand tilde in save_path (POSIX file in AppleScript does not expand ~)
-    expanded_path = os.path.expanduser(save_path)
+    if not attachment_name or not save_path:
+        return "Error: attachment_name and save_path are required"
 
-    # Path validation: resolve to absolute path and enforce safety constraints
-    resolved_path = os.path.realpath(expanded_path)
-    home_dir = os.path.expanduser("~")
+    # Resolve the destination and reject protected locations (#103).
+    # Resolving also expands ~, which POSIX file in AppleScript does not.
+    expanded_path, path_error = validate_write_path(save_path)
+    if path_error:
+        return path_error
 
-    # Must be under the user's home directory
-    if not resolved_path.startswith(home_dir + os.sep) and resolved_path != home_dir:
-        return f"Error: Save path must be under your home directory ({home_dir}). Got: {resolved_path}"
-
-    # Block sensitive directories
-    sensitive_dirs = [
-        os.path.join(home_dir, ".ssh"),
-        os.path.join(home_dir, ".gnupg"),
-        os.path.join(home_dir, ".config"),
-        os.path.join(home_dir, ".aws"),
-        os.path.join(home_dir, ".claude"),
-        os.path.join(home_dir, "Library", "LaunchAgents"),
-        os.path.join(home_dir, "Library", "LaunchDaemons"),
-        os.path.join(home_dir, "Library", "Keychains"),
-    ]
-    for sensitive_dir in sensitive_dirs:
-        if (
-            resolved_path.startswith(sensitive_dir + os.sep)
-            or resolved_path == sensitive_dir
-        ):
-            return f"Error: Cannot save attachments to sensitive directory: {sensitive_dir}"
-
-    expanded_path = resolved_path
+    if message_id is not None:
+        message_id = str(message_id).strip()
+        if not message_id or not message_id.isascii() or not message_id.isdigit():
+            return "Error: message_id must contain digits only"
+    elif not subject_keyword:
+        return "Error: subject_keyword or message_id is required"
 
     # Escape for AppleScript
     escaped_account = escape_applescript(account)
     escaped_keyword = escape_applescript(subject_keyword)
     escaped_attachment = escape_applescript(attachment_name)
     escaped_path = escape_applescript(expanded_path)
+    escaped_mailbox = escape_applescript(mailbox)
 
     script = f'''
     tell application "Mail"
@@ -300,11 +298,11 @@ def save_email_attachment(
 
         try
             set targetAccount to account "{escaped_account}"
-            {inbox_mailbox_script("inboxMailbox", "targetAccount")}
-            set inboxMessages to every message of inboxMailbox
+            {build_mailbox_ref(mailbox, account_var="targetAccount", var_name="targetMailbox")}
+            set mailboxMessages to every message of targetMailbox
             set foundAttachment to false
 
-            repeat with aMessage in inboxMessages
+            repeat with aMessage in mailboxMessages
                 try
                     set messageSubject to subject of aMessage
 
@@ -338,6 +336,57 @@ def save_email_attachment(
                 set outputText to "⚠ Attachment not found" & return
                 set outputText to outputText & "Email keyword: {escaped_keyword}" & return
                 set outputText to outputText & "Attachment name: {escaped_attachment}" & return
+                set outputText to outputText & "Searched mailbox: {escaped_mailbox}" & return
+            end if
+
+        on error errMsg
+            return "Error: " & errMsg
+        end try
+
+        return outputText
+    end tell
+    '''
+
+    if message_id is not None:
+        script = f'''
+    tell application "Mail"
+        set outputText to ""
+
+        try
+            set targetAccount to account "{escaped_account}"
+            {build_mailbox_ref(mailbox, account_var="targetAccount", var_name="targetMailbox")}
+            set targetMessage to «class mssg» id {message_id} of targetMailbox
+            set messageSubject to subject of targetMessage
+        on error
+            return "Error: message {message_id} not found in mailbox {escaped_mailbox} of account {escaped_account}"
+        end try
+
+        try
+            set foundAttachment to false
+            set msgAttachments to mail attachments of targetMessage
+
+            repeat with anAttachment in msgAttachments
+                set attachmentFileName to name of anAttachment
+
+                if attachmentFileName contains "{escaped_attachment}" then
+                    -- Save the attachment
+                    save anAttachment in POSIX file "{escaped_path}"
+
+                    set outputText to "✓ Attachment saved successfully!" & return & return
+                    set outputText to outputText & "Email: " & messageSubject & return
+                    set outputText to outputText & "Attachment: " & attachmentFileName & return
+                    set outputText to outputText & "Saved to: {escaped_path}" & return
+
+                    set foundAttachment to true
+                    exit repeat
+                end if
+            end repeat
+
+            if not foundAttachment then
+                set outputText to "⚠ Attachment not found" & return
+                set outputText to outputText & "Email keyword: " & messageSubject & return
+                set outputText to outputText & "Attachment name: {escaped_attachment}" & return
+                set outputText to outputText & "Searched mailbox: {escaped_mailbox}" & return
             end if
 
         on error errMsg
@@ -622,6 +671,13 @@ def manage_trash(
     When dry_run=True (default) and action is "move_to_trash", previews what
     would be deleted without acting. Set dry_run=False to actually move to trash.
 
+    Mail's AppleScript interface has no command that erases a message: `delete`
+    means "move to Trash", and on a message that already sits in Trash it does
+    nothing. "delete_permanent" and "empty_trash" therefore usually remove
+    nothing at all. Both report the real before/after mailbox count instead of
+    the number of delete calls, and say so when nothing was removed; emptying
+    the trash for good has to happen in Mail itself.
+
     Args:
         account: Account name (e.g., "Gmail", "Work")
         action: Action to perform: "move_to_trash", "delete_permanent", "empty_trash"
@@ -639,6 +695,13 @@ def manage_trash(
         Confirmation message with details of deleted emails
     """
 
+    # Anything unrecognised used to fall through to the move_to_trash branch.
+    if action not in ("move_to_trash", "delete_permanent", "empty_trash"):
+        return (
+            f"Error: Invalid action '{action}'. "
+            "Use: move_to_trash, delete_permanent, empty_trash"
+        )
+
     # Escape all user inputs for AppleScript
     safe_account = escape_applescript(account)
     safe_mailbox = escape_applescript(mailbox)
@@ -647,7 +710,7 @@ def manage_trash(
     if action == "empty_trash":
         if not confirm_empty:
             return (
-                "Error: empty_trash permanently deletes ALL messages in the trash. "
+                "Error: empty_trash attempts to delete ALL messages in the trash. "
                 "Set confirm_empty=True to proceed."
             )
         script = f'''
@@ -661,16 +724,29 @@ def manage_trash(
                 set messageCount to count of trashMessages
                 set deleteCount to 0
 
-                -- Delete messages in trash, respecting max_deletes
-                repeat with aMessage in trashMessages
+                -- Delete messages in trash, respecting max_deletes.
+                -- trashMessages is a list captured up front, so deleting does
+                -- not shift its indices; a forward loop takes the first N.
+                repeat with msgIndex from 1 to messageCount
                     if deleteCount >= {max_deletes} then exit repeat
-                    delete aMessage
+                    delete (item msgIndex of trashMessages)
                     set deleteCount to deleteCount + 1
                 end repeat
 
-                set outputText to outputText & "✓ Emptied trash for account: {safe_account}" & return
-                set outputText to outputText & "   Deleted " & deleteCount & " of " & messageCount & " message(s)" & return
-                if deleteCount < messageCount then
+                -- Report what actually left the mailbox, not how often the
+                -- delete command was issued. Mail's AppleScript `delete` means
+                -- "move to Trash"; on a message that already sits in Trash it
+                -- is a no-op, and the old count reported those no-ops as
+                -- successful deletions.
+                set remainingCount to count of messages of trashMailbox
+                set removedCount to messageCount - remainingCount
+
+                set outputText to outputText & "Account: {safe_account}" & return
+                set outputText to outputText & "   Trash before: " & messageCount & ", after: " & remainingCount & return
+                set outputText to outputText & "   Actually removed: " & removedCount & " message(s)" & return
+                if removedCount is 0 then
+                    set outputText to outputText & "⚠ Nothing was removed. Mail's AppleScript interface has no command that erases messages from the trash; `delete` only moves a message to Trash. Empty the trash in Mail itself." & return
+                else if deleteCount < messageCount then
                     set outputText to outputText & "   (limited by max_deletes=" & {max_deletes} & ")" & return
                 end if
 
@@ -723,21 +799,36 @@ def manage_trash(
                         set targetMessages to matchingMessages
                     end if
 
-                    repeat with aMessage in targetMessages
+                    set trashBefore to count of messages of trashMailbox
+
+                    -- Walk the captured list (deleting does not shift its
+                    -- indices) and only name a message once its delete call
+                    -- returned without error.
+                    repeat with msgIndex from (count of targetMessages) to 1 by -1
                         try
+                            set aMessage to item msgIndex of targetMessages
                             set messageSubject to subject of aMessage
                             set messageSender to sender of aMessage
 
-                            set outputText to outputText & "✓ Permanently deleted: " & messageSubject & return
-                            set outputText to outputText & "   From: " & messageSender & return & return
-
                             delete aMessage
                             set deleteCount to deleteCount + 1
+
+                            set outputText to outputText & "Targeted: " & messageSubject & return
+                            set outputText to outputText & "   From: " & messageSender & return & return
                         end try
                     end repeat
 
+                    -- The truth is the mailbox count, not the number of delete
+                    -- calls: Mail's `delete` means "move to Trash" and does
+                    -- nothing to a message that is already there.
+                    set trashAfter to count of messages of trashMailbox
+                    set removedCount to trashBefore - trashAfter
+
                     set outputText to outputText & "========================================" & return
-                    set outputText to outputText & "TOTAL DELETED: " & deleteCount & " email(s)" & return
+                    set outputText to outputText & "TARGETED: " & deleteCount & ", ACTUALLY REMOVED: " & removedCount & return
+                    if removedCount is 0 and deleteCount > 0 then
+                        set outputText to outputText & "⚠ Nothing was erased. Mail's AppleScript interface cannot permanently delete a message that already sits in Trash. Erase it in Mail itself." & return
+                    end if
                     set outputText to outputText & "========================================" & return
 
                 on error errMsg

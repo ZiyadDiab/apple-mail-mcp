@@ -2,6 +2,7 @@
 
 import json
 from typing import Optional, List, Dict, Any
+from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
@@ -23,15 +24,24 @@ def _parse_pipe_delimited_emails(raw: str) -> List[Dict[str, Any]]:
             continue
         parts = line.split("|||")
         if len(parts) >= 5:
-            emails.append(
-                {
-                    "subject": parts[0].strip(),
-                    "sender": parts[1].strip(),
-                    "date": parts[2].strip(),
-                    "is_read": parts[3].strip().lower() == "true",
-                    "account": parts[4].strip(),
-                }
-            )
+            email: Dict[str, Any] = {
+                "subject": parts[0].strip(),
+                "sender": parts[1].strip(),
+                "date": parts[2].strip(),
+                "is_read": parts[3].strip().lower() == "true",
+                "account": parts[4].strip(),
+            }
+            # Trailing identity fields mirror search_emails: the internal Mail id
+            # (precise targeting) and the RFC Message-ID (citation / deep link).
+            if len(parts) >= 6 and parts[5].strip():
+                email["message_id"] = parts[5].strip()
+            if len(parts) >= 7:
+                internet_message_id = parts[6].strip()
+                if internet_message_id:
+                    email["internet_message_id"] = internet_message_id
+                    msg_id = internet_message_id.strip("<>")
+                    email["mail_link"] = f"message://%3C{quote(msg_id, safe='@')}%3E"
+            emails.append(email)
     return emails
 
 
@@ -64,6 +74,10 @@ def list_inbox_emails(
     if output_format == "json":
         return _list_inbox_emails_json(account, max_emails, include_read, include_content)
 
+    escaped_account = escape_applescript(account) if account else None
+    account_filter = f'if accountName is "{escaped_account}" then' if account else ""
+    account_filter_end = "end if" if account else ""
+
     script = f"""
     tell application "Mail"
         set outputText to "INBOX EMAILS - ALL ACCOUNTS" & return & return
@@ -72,6 +86,7 @@ def list_inbox_emails(
 
         repeat with anAccount in allAccounts
             set accountName to name of anAccount
+            {account_filter}
 
             try
                 {inbox_mailbox_script("inboxMailbox", "anAccount")}
@@ -93,6 +108,10 @@ def list_inbox_emails(
                             set messageSender to sender of aMessage
                             set messageDate to date received of aMessage
                             set messageRead to read status of aMessage
+                            set messageInternetId to ""
+                            try
+                                set messageInternetId to message id of aMessage
+                            end try
 
                             set shouldInclude to true
                             if not {str(include_read).lower()} and messageRead then
@@ -109,6 +128,12 @@ def list_inbox_emails(
                                 set outputText to outputText & readIndicator & " " & messageSubject & return
                                 set outputText to outputText & "   From: " & messageSender & return
                                 set outputText to outputText & "   Date: " & (messageDate as string) & return
+                                if messageInternetId is not "" then
+                                    set cleanMid to messageInternetId
+                                    if cleanMid starts with "<" then set cleanMid to text 2 thru -1 of cleanMid
+                                    if cleanMid ends with ">" then set cleanMid to text 1 thru -2 of cleanMid
+                                    set outputText to outputText & "   Link: message://%3C" & cleanMid & "%3E" & return
+                                end if
 
                                 {content_preview_script(200) if include_content else ""}
 
@@ -123,6 +148,7 @@ def list_inbox_emails(
                 set outputText to outputText & "⚠ Error accessing inbox for account " & accountName & return
                 set outputText to outputText & "   " & errMsg & return & return
             end try
+            {account_filter_end}
         end repeat
 
         set outputText to outputText & "========================================" & return
@@ -167,12 +193,17 @@ def _list_inbox_emails_json(
                         set messageSender to sender of aMessage
                         set messageDate to date received of aMessage
                         set messageRead to read status of aMessage
+                        set messageInternalId to (id of aMessage) as string
+                        set messageInternetId to ""
+                        try
+                            set messageInternetId to message id of aMessage
+                        end try
                         set shouldInclude to true
                         if not {str(include_read).lower()} and messageRead then
                             set shouldInclude to false
                         end if
                         if shouldInclude then
-                            set end of resultLines to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName
+                            set end of resultLines to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName & "|||" & messageInternalId & "|||" & messageInternetId
                         end if
                     end try
                 end repeat
@@ -213,40 +244,6 @@ def get_mailbox_unread_counts(
     """
     escaped_account = escape_applescript(account) if account else None
 
-    # Fast path: summary_only returns just per-account inbox unread totals
-    if summary_only:
-        script = f"""
-        tell application "Mail"
-            set resultList to {{}}
-            set allAccounts to every account
-
-            repeat with anAccount in allAccounts
-                set accountName to name of anAccount
-
-                try
-                    {inbox_mailbox_script("inboxMailbox", "anAccount")}
-                    set unreadCount to unread count of inboxMailbox
-                    set end of resultList to accountName & ":" & unreadCount
-                on error
-                    set end of resultList to accountName & ":ERROR"
-                end try
-            end repeat
-
-            set AppleScript's text item delimiters to "|"
-            return resultList as string
-        end tell
-        """
-        result = run_applescript(script)
-        counts: Dict[str, int] = {}
-        for item in result.split("|"):
-            if ":" in item:
-                acct_name, count_str = item.split(":", 1)
-                if count_str != "ERROR":
-                    counts[acct_name] = int(count_str)
-                else:
-                    counts[acct_name] = -1
-        return counts
-
     account_filter = (
         f'''
             if accountName is not "{escaped_account}" then
@@ -256,6 +253,48 @@ def get_mailbox_unread_counts(
         if account
         else ""
     )
+
+    # Fast path: summary_only returns just per-account inbox unread totals
+    if summary_only:
+        script = f"""
+        tell application "Mail"
+            set resultList to {{}}
+            set allAccounts to every account
+
+            repeat with anAccount in allAccounts
+                set accountName to name of anAccount
+                set shouldIncludeAccount to true
+                {account_filter}
+
+                if shouldIncludeAccount then
+                    try
+                        {inbox_mailbox_script("inboxMailbox", "anAccount")}
+                        set unreadCount to unread count of inboxMailbox
+                        set end of resultList to accountName & ":" & unreadCount
+                    on error
+                        set end of resultList to accountName & ":ERROR"
+                    end try
+                end if
+            end repeat
+
+            set AppleScript's text item delimiters to linefeed
+            return resultList as string
+        end tell
+        """
+        result = run_applescript(script)
+        counts: Dict[str, int] = {}
+        # One record per line, count after the LAST colon: account names may
+        # contain both "|" and ":" ("Jane Doe | Example Corp").
+        for item in result.splitlines():
+            if ":" not in item:
+                continue
+            acct_name, _, count_str = item.rpartition(":")
+            acct_name = acct_name.strip()
+            if count_str != "ERROR":
+                counts[acct_name] = int(count_str)
+            else:
+                counts[acct_name] = -1
+        return counts
 
     script = f"""
     tell application "Mail"
@@ -331,6 +370,10 @@ def list_accounts() -> List[str]:
         List of account names
     """
 
+    # One name per line. The previous "|" delimiter split any account whose
+    # own name contains a pipe (e.g. "Jane Doe | Example Corp")
+    # into two unusable fragments, and every follow-up call with such a
+    # fragment failed with "account not found".
     script = """
     tell application "Mail"
         set accountNames to {}
@@ -341,13 +384,15 @@ def list_accounts() -> List[str]:
             set end of accountNames to accountName
         end repeat
 
-        set AppleScript's text item delimiters to "|"
+        set AppleScript's text item delimiters to linefeed
         return accountNames as string
     end tell
     """
 
     result = run_applescript(script)
-    return result.split("|") if result else []
+    if not result:
+        return []
+    return [line.strip() for line in result.splitlines() if line.strip()]
 
 
 @mcp.tool()
@@ -384,7 +429,7 @@ def list_account_addresses() -> Dict[str, List[str]]:
             set AppleScript's text item delimiters to ","
             set addrStr to emailAddrs as string
             set AppleScript's text item delimiters to ""
-            set end of outLines to acctName & "|" & addrStr
+            set end of outLines to acctName & "|||" & addrStr
         end repeat
 
         set AppleScript's text item delimiters to linefeed
@@ -399,10 +444,12 @@ def list_account_addresses() -> Dict[str, List[str]]:
     if not result:
         return out
     for line in result.splitlines():
-        if "|" not in line:
+        # Split on the LAST "|||" so an account name containing a pipe
+        # ("Jane Doe | Example Corp") stays intact.
+        if "|||" not in line:
             continue
-        name, addrs = line.split("|", 1)
-        out[name] = [a.strip() for a in addrs.split(",") if a.strip()]
+        name, _, addrs = line.rpartition("|||")
+        out[name.strip()] = [a.strip() for a in addrs.split(",") if a.strip()]
     return out
 
 

@@ -4,18 +4,39 @@ import os
 import subprocess
 import tempfile
 import re
-import time
 from email.message import EmailMessage
 from html import escape as html_escape
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-from apple_mail_mcp.server import mcp, READ_ONLY
+from apple_mail_mcp import server
+from apple_mail_mcp.server import mcp
+from apple_mail_mcp.paths import validate_read_path, validate_write_path
+from apple_mail_mcp.tools.raw_source import get_email_source
+from apple_mail_mcp.tools.reply_verification import (
+    verify_reply_body_outside_quote,
+    verify_recipients,
+)
 from apple_mail_mcp.core import (
     inject_preferences,
     escape_applescript,
     run_applescript,
     inbox_mailbox_script,
+    build_mailbox_ref,
+    mail_automation_lock,
+    MAIL_AUTOMATION_BUSY_ERROR,
+)
+
+# Explicit font stack for HTML fragments that get pasted into Mail's compose
+# editor via NSPasteboard. Cocoa's HTML->NSAttributedString importer does not
+# resolve CSS shorthand like `font: inherit`, and a fragment with no
+# font-family at all resolves even worse (falls back to Times-Roman). Every
+# fragment needs a concrete font-family value or it silently renders in a
+# small serif font instead of the sans-serif Mail normally composes in.
+# See #100.
+_COMPOSE_FONT_STYLE = (
+    "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, "
+    "sans-serif; font-size: 13px;"
 )
 from apple_mail_mcp.smtp_send import (
     account_config,
@@ -181,9 +202,9 @@ def _build_html_from_text(text_body):
     """Return a simple HTML wrapper for plain text content."""
     safe_body = html_escape(text_body or "")
     return (
-        '<html><body style="font-family: -apple-system, BlinkMacSystemFont, '
-        "'Segoe UI', Arial, sans-serif; line-height: 1.45; color: #111111;\">"
-        '<pre style="white-space: pre-wrap; font: inherit; margin: 0;">'
+        f'<html><body style="{_COMPOSE_FONT_STYLE} line-height: 1.45; '
+        'color: #111111;">'
+        f'<pre style="white-space: pre-wrap; margin: 0; {_COMPOSE_FONT_STYLE}">'
         + safe_body
         + "</pre></body></html>"
     )
@@ -262,35 +283,11 @@ def _prepare_rich_bodies(subject, text_body, html_body):
     return plain_body, rich_body, []
 
 
-def _save_open_message_as_draft(subject, retries=10, delay_seconds=0.5):
-    """Ask Mail to save the matching open outgoing message as a draft."""
-    if not subject:
-        return False
-
-    safe_subject = escape_applescript(subject)
-    script = f'''
-    tell application "Mail"
-        try
-            set matchingMessages to every outgoing message whose subject is "{safe_subject}"
-            if (count of matchingMessages) is 0 then
-                return "not-found"
-            end if
-            save item 1 of matchingMessages
-            return "saved"
-        on error errMsg
-            return "error: " & errMsg
-        end try
-    end tell
-    '''
-
-    for _ in range(retries):
-        result = run_applescript(script).strip().lower()
-        if result == "saved":
-            return True
-        if result.startswith("error:"):
-            break
-        time.sleep(delay_seconds)
-    return False
+_SAVE_AS_DRAFT_UNSUPPORTED_NOTE = (
+    "save_as_draft could not be honored: Mail opens a `.eml` file as a read-only message "
+    "viewer, not a compose object, so there is no draft for Mail to save here. Use "
+    "compose_email(mode=\"draft\") or manage_drafts for a real, sendable HTML draft instead."
+)
 
 
 @mcp.tool()
@@ -322,9 +319,13 @@ def create_rich_email_draft(
         html_body: Optional HTML body. If omitted but text_body is provided, a basic HTML wrapper is generated.
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
-        output_path: Optional path for the generated `.eml` file
+        output_path: Optional path for the generated `.eml` file (same protected-location
+            rules as save_email_attachment; defaults to ~/Library/Caches/apple-mail-mcp/rich-drafts)
         open_in_mail: If True, open the generated `.eml` in Mail (default: True)
-        save_as_draft: If True, ask Mail to save the opened compose window into Drafts (default: False)
+        save_as_draft: Not currently supported. Mail opens a `.eml` as a read-only message
+            viewer, not a compose object, so it can never be saved into Drafts this way.
+            Passing True is reported honestly in the output rather than silently ignored;
+            use `compose_email(mode="draft")` or `manage_drafts` for a real, sendable draft.
         from_address: Optional sender address to stamp into the `.eml` `From:` header. Must be one of the account's configured email addresses. When omitted, Mail fills the account's default "Send new messages from" address on open.
 
     Returns:
@@ -371,21 +372,21 @@ def create_rich_email_draft(
     message.set_content(plain_body)
     message.add_alternative(rich_body, subtype="html")
 
-    draft_path = (
-        Path(output_path).expanduser()
-        if output_path
-        else _default_rich_draft_path(subject)
-    )
+    if output_path:
+        safe_output_path, path_error = validate_write_path(output_path)
+        if path_error:
+            return path_error
+        draft_path = Path(safe_output_path)
+    else:
+        draft_path = _default_rich_draft_path(subject)
     draft_path.parent.mkdir(parents=True, exist_ok=True)
     draft_path.write_bytes(bytes(message))
 
     opened = False
-    saved = False
+    save_requested = open_in_mail and save_as_draft
     if open_in_mail:
         subprocess.run(["open", "-a", "Mail", str(draft_path)], check=True)
         opened = True
-        if save_as_draft:
-            saved = _save_open_message_as_draft(subject)
 
     output_lines = ["RICH EMAIL DRAFT", "", "✓ Rich draft prepared successfully!", ""]
     output_lines.append("Account: " + account)
@@ -393,7 +394,9 @@ def create_rich_email_draft(
     output_lines.append("EML path: " + str(draft_path))
     output_lines.append("Opened in Mail: " + ("yes" if opened else "no"))
     if open_in_mail:
-        output_lines.append("Saved in Drafts: " + ("yes" if saved else "no"))
+        output_lines.append("Saved in Drafts: no")
+        if save_requested:
+            output_lines.append("Note: " + _SAVE_AS_DRAFT_UNSUPPORTED_NOTE)
     if sender_address:
         output_lines.append("From: " + sender_address)
     if recipients_to:
@@ -583,12 +586,13 @@ return "{success_text}"
 '''
 
     try:
-        result = subprocess.run(
-            ["osascript", "-"],
-            input=script.encode("utf-8"),
-            capture_output=True,
-            timeout=30,
-        )
+        with mail_automation_lock():
+            result = subprocess.run(
+                ["osascript", "-"],
+                input=script.encode("utf-8"),
+                capture_output=True,
+                timeout=30,
+            )
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             return f"Error sending HTML email: {stderr}"
@@ -604,6 +608,8 @@ return "{success_text}"
         return confirm
     except subprocess.TimeoutExpired:
         return "Error: HTML email script timed out"
+    except TimeoutError:
+        return MAIL_AUTOMATION_BUSY_ERROR
     finally:
         if os.path.exists(html_temp_path):
             os.unlink(html_temp_path)
@@ -613,25 +619,13 @@ def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[st
     """Validate and resolve attachment file paths.
 
     Splits comma-separated paths, expands tildes, resolves symlinks,
-    and enforces security constraints (home-dir-only, no sensitive dirs,
-    file must exist).
+    and enforces the shared read guard from ``apple_mail_mcp.paths``
+    (no secrets such as ~/.ssh, keychains or browser profiles; file must exist).
 
     Returns:
         A tuple of (resolved_paths, error_message).
         If error_message is not None, resolved_paths should be ignored.
     """
-    home_dir = os.path.expanduser("~")
-    sensitive_dirs = [
-        os.path.join(home_dir, ".ssh"),
-        os.path.join(home_dir, ".gnupg"),
-        os.path.join(home_dir, ".config"),
-        os.path.join(home_dir, ".aws"),
-        os.path.join(home_dir, ".claude"),
-        os.path.join(home_dir, "Library", "LaunchAgents"),
-        os.path.join(home_dir, "Library", "LaunchDaemons"),
-        os.path.join(home_dir, "Library", "Keychains"),
-    ]
-
     resolved_paths: List[str] = []
     raw_paths = [p.strip() for p in attachments.split(",")]
 
@@ -639,24 +633,9 @@ def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[st
         if not raw_path:
             continue
 
-        # Expand tilde and resolve symlinks
-        expanded = os.path.expanduser(raw_path)
-        resolved = os.path.realpath(expanded)
-
-        # Must be under the user's home directory
-        if not resolved.startswith(home_dir + os.sep) and resolved != home_dir:
-            return (
-                [],
-                f"Error: Attachment path must be under your home directory ({home_dir}). Got: {resolved}",
-            )
-
-        # Block sensitive directories
-        for sensitive_dir in sensitive_dirs:
-            if resolved.startswith(sensitive_dir + os.sep) or resolved == sensitive_dir:
-                return (
-                    [],
-                    f"Error: Cannot attach files from sensitive directory: {sensitive_dir}",
-                )
+        resolved, path_error = validate_read_path(raw_path)
+        if path_error:
+            return [], path_error
 
         # File must exist
         if not os.path.isfile(resolved):
@@ -668,6 +647,57 @@ def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[st
         return [], "Error: No valid attachment paths provided."
 
     return resolved_paths, None
+
+
+def _verify_saved_reply_body(
+    account: str,
+    message_id: Optional[str],
+    reply_body: str,
+    expected_cc: Optional[str] = None,
+    expected_from: Optional[str] = None,
+    body_html: Optional[str] = None,
+) -> str:
+    """Verify body placement and headers using the saved draft's RFC Message-ID.
+
+    The save script excludes pre-existing Drafts IDs and accepts only one
+    new draft with the exact reply subject. Never fall back to a subject
+    lookup when that identity is unavailable or ambiguous. Send/open modes
+    do not have a saved draft to inspect and do not call this helper.
+    """
+    if not message_id:
+        return "Status: FAILED — could not uniquely identify the saved draft."
+    try:
+        raw_source = get_email_source(
+            account=account, message_id=message_id, mailbox="Drafts"
+        )
+    except TimeoutError:
+        # The draft is already saved; a busy automation lock only prevents
+        # re-reading it. Report that, rather than letting the caller's lock
+        # handler mask the successful save as a busy error.
+        return (
+            "Status: FAILED — Verification: could not re-read the saved draft "
+            f"({MAIL_AUTOMATION_BUSY_ERROR})"
+        )
+    if raw_source.startswith("Error"):
+        return f"Status: FAILED — Verification: could not re-read the saved draft ({raw_source})"
+
+    body_verified, body_detail = verify_reply_body_outside_quote(
+        raw_source, reply_body, body_html=body_html
+    )
+    body_status = "PASSED" if body_verified else "FAILED"
+    lines = [f"Verification ({body_status}): {body_detail}"]
+
+    problems = [] if body_verified else [body_detail]
+    recipients_verified, recipients_detail = verify_recipients(
+        raw_source, expected_cc=expected_cc, expected_from=expected_from
+    )
+    if not recipients_verified:
+        problems.append(recipients_detail)
+    recipients_status = "PASSED" if recipients_verified else "FAILED"
+    lines.append(f"Recipients ({recipients_status}): {recipients_detail}")
+
+    status = "Status: FAILED — " + "; ".join(problems) if problems else "Status: VERIFIED"
+    return "\n".join([status] + lines)
 
 
 @mcp.tool()
@@ -706,7 +736,21 @@ def reply_to_email(
         Confirmation message with details of the reply sent, saved draft, or opened draft
     """
 
-    # Upstream input hygiene, runs for both the server-direct and GUI paths.
+    # Resolve the delivery mode and apply the read-only guard before anything
+    # else: the temp files written below would otherwise leak on refusal.
+    if mode is not None:
+        if mode not in ("send", "draft", "open"):
+            return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
+        effective_mode = mode
+    else:
+        effective_mode = "send" if send else "draft"
+
+    if server.READ_ONLY and effective_mode == "send":
+        return (
+            "Error: Sending is disabled in read-only mode. "
+            'Use mode="draft" to save the reply, or mode="open" to review it in Mail.'
+        )
+
     reply_body = _strip_cdata_wrappers(reply_body) or ""
     body_html = _strip_cdata_wrappers(body_html)
 
@@ -779,7 +823,9 @@ def reply_to_email(
         # Wrap plain text in HTML, converting newlines to <br>
         escaped_plain = html_escape(reply_body)
         escaped_plain = escaped_plain.replace("\n", "<br>")
-        html_content = f"<div>{escaped_plain}</div>{gap_html}"
+        html_content = (
+            f'<div style="{_COMPOSE_FONT_STYLE}">{escaped_plain}</div>{gap_html}'
+        )
     html_tmp = tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".html",
@@ -839,14 +885,6 @@ def reply_to_email(
         escape_applescript(attachment_info) if attachment_info else ""
     )
 
-    # Resolve delivery mode: mode parameter takes precedence over send boolean
-    if mode is not None:
-        if mode not in ("send", "draft", "open"):
-            return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
-        effective_mode = mode
-    else:
-        effective_mode = "send" if send else "draft"
-
     # Read body from temp file in AppleScript (avoids all string escaping issues)
     read_body_script = f'set replyBodyText to do shell script "cat " & quoted form of "{body_temp_path}"'
 
@@ -866,7 +904,12 @@ def reply_to_email(
         success_text = "Reply sent successfully!"
     elif effective_mode == "open":
         header_text = "OPENING REPLY FOR REVIEW"
-        post_paste_action = ""
+        # Nothing follows the paste in open mode, so the clipboard restore
+        # would run only 0.5s after Cmd+V. Wait as long as send/draft do
+        # before restoring, so a slow paste can't pick up the restored
+        # clipboard instead of the reply body (#106).
+        post_paste_action = """
+                delay 0.5"""
         success_text = "Reply opened in Mail for review. Edit and send when ready."
     else:  # draft
         header_text = "SAVING REPLY AS DRAFT"
@@ -880,6 +923,66 @@ def reply_to_email(
                 delay 0.5
                 close window 1"""
         success_text = "Reply saved as draft!"
+
+    draft_snapshot_script = ""
+    draft_identity_script = ""
+    if effective_mode == "draft":
+        # Outgoing composer IDs are not RFC Message-IDs. Snapshot mailbox
+        # IDs before creating the reply (which can autosave), then resolve
+        # the one new exact-subject draft after close/save. Reject ambiguity
+        # rather than risk verifying an older or concurrently created reply.
+        # The snapshot has its own try: an account without a mailbox named
+        # "Drafts" must still save the reply. With no snapshot the identity
+        # lookup is skipped, so verification reports FAILED instead of
+        # risking a match against an older draft.
+        draft_snapshot_script = f"""
+            set draftMailbox to missing value
+            set priorDraftIDs to {{}}
+            set draftSnapshotOK to false
+            try
+                {build_mailbox_ref("Drafts", var_name="draftMailbox")}
+                set priorDraftIDs to id of every message of draftMailbox
+                set draftSnapshotOK to true
+            end try
+        """
+        post_paste_action = """
+                set savedReplySubject to subject of replyMessage
+                delay 0.5
+                close window 1 saving yes
+        """
+        # New candidates are grouped by RFC Message-ID: Gmail can leave
+        # several autosave/sync copies of one draft, all sharing a
+        # Message-ID. Two distinct Message-IDs are still rejected as ambiguous.
+        draft_identity_script = """
+            set savedDraftMessageID to ""
+            if draftSnapshotOK then
+                repeat 20 times
+                    set newDraftMessageIDs to {}
+                    set matchingDrafts to (messages of draftMailbox whose subject is savedReplySubject)
+                    repeat with candidate in matchingDrafts
+                        if priorDraftIDs does not contain (id of candidate) then
+                            set candidateMessageID to message id of candidate
+                            if candidateMessageID is missing value then set candidateMessageID to ""
+                            if newDraftMessageIDs does not contain candidateMessageID then
+                                set end of newDraftMessageIDs to candidateMessageID
+                            end if
+                        end if
+                    end repeat
+                    if (count of newDraftMessageIDs) is greater than 1 then exit repeat
+                    if (count of newDraftMessageIDs) is 1 then
+                        set candidateMessageID to item 1 of newDraftMessageIDs
+                        if candidateMessageID is not "" then
+                            set savedDraftMessageID to candidateMessageID
+                            exit repeat
+                        end if
+                    end if
+                    delay 0.25
+                end repeat
+            else
+                set outputText to outputText & "Note: could not read the Drafts mailbox, so the saved draft cannot be verified." & return
+            end if
+            set outputText to outputText & "Saved draft Message-ID: " & savedDraftMessageID & return
+        """
 
     cleanup_script = f'do shell script "rm -f " & quoted form of "{body_temp_path}"'
     html_cleanup_script = f'do shell script "rm -f \'{html_temp_path}\'"'
@@ -927,6 +1030,9 @@ tell application "Mail"
             set messageSubject to subject of foundMessage
             set messageSender to sender of foundMessage
             set messageDate to date received of foundMessage
+
+            -- Snapshot before creation, since Mail may autosave the reply.
+            {draft_snapshot_script}
 
             -- Create reply
             {reply_command}
@@ -980,6 +1086,7 @@ tell application "Mail"
             delay 0.5
 
             {post_paste_action}
+            {draft_identity_script}
 
             set outputText to outputText & "{success_text}" & return
             set outputText to outputText & "To: " & messageSender & return
@@ -1016,33 +1123,60 @@ tell application "Mail"
                 {cleanup_script}
                 {html_cleanup_script}
             end try
-            return "Error: " & errMsg & return & "Please check that the account name is correct and the email exists."
+            set outputText to "Error: " & errMsg & return & "Please check that the account name is correct and the email exists."
         end try
-
-        return outputText
     end tell
 
-    -- Restore clipboard
+    -- Restore clipboard. Every path must fall through to here: a `return`
+    -- inside the tell block above would skip this and leave the reply body
+    -- on the user's clipboard (#106).
     if oldClip is not missing value then
         pb's clearContents()
         pb's setString:oldClip forType:(current application's NSPasteboardTypeString)
     end if
+
+    return outputText
     """
 
     try:
         # Use osascript directly for AppleScriptObjC (use framework) support
-        result = subprocess.run(
-            ["osascript", "-"],
-            input=script.encode("utf-8"),
-            capture_output=True,
-            timeout=30,
-        )
+        with mail_automation_lock():
+            result = subprocess.run(
+                ["osascript", "-"],
+                input=script.encode("utf-8"),
+                capture_output=True,
+                timeout=30,
+            )
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             return f"Error in reply: {stderr}"
-        return result.stdout.decode("utf-8", errors="replace").strip()
+        output_text = result.stdout.decode("utf-8", errors="replace").strip()
+        # Checking for the absence of "Error" is not enough: "No email found
+        # matching: <keyword>" is also a failure to reach a saved draft, and
+        # does not start with "Error" either. `success_text` is the one
+        # positive signal this function's own AppleScript emits only on the
+        # branch that actually saved something.
+        if effective_mode == "draft" and success_text in output_text:
+            identity_lines = [
+                line.removeprefix("Saved draft Message-ID: ").strip()
+                for line in output_text.splitlines()
+                if line.startswith("Saved draft Message-ID: ")
+            ]
+            saved_message_id = identity_lines[0] if len(identity_lines) == 1 else None
+            verification = _verify_saved_reply_body(
+                account,
+                saved_message_id,
+                reply_body,
+                expected_cc=cc,
+                expected_from=sender_override,
+                body_html=body_html,
+            )
+            output_text = verification + "\n" + output_text
+        return output_text
     except subprocess.TimeoutExpired:
         return "Error: Reply script timed out"
+    except TimeoutError:
+        return MAIL_AUTOMATION_BUSY_ERROR
     finally:
         # Belt-and-suspenders cleanup in case AppleScript didn't run
         if os.path.exists(body_temp_path):
@@ -1088,6 +1222,12 @@ def compose_email(
     # Validate mode
     if mode not in ("send", "draft", "open"):
         return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
+
+    if server.READ_ONLY and mode == "send":
+        return (
+            "Error: Sending is disabled in read-only mode. "
+            'Use mode="draft" to save the message, or mode="open" to review it in Mail.'
+        )
 
     body = _strip_cdata_wrappers(body) or ""
     body_html = _strip_cdata_wrappers(body_html)
@@ -1324,6 +1464,11 @@ def forward_email(
     if mode not in ("send", "draft", "open"):
         return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
 
+    # forward_email is removed from the tool list under --read-only; this
+    # guard keeps it safe even if that removal ever fails.
+    if server.READ_ONLY:
+        return "Error: Forwarding is disabled in read-only mode."
+
     message = _strip_cdata_wrappers(message)
 
     sender_override, sender_error = _validate_from_address(account, from_address)
@@ -1381,7 +1526,9 @@ def forward_email(
     if message:
         escaped_plain = html_escape(message)
         escaped_plain = escaped_plain.replace("\n", "<br>")
-        fwd_html_content = f"{escaped_plain}<br><br>"
+        fwd_html_content = (
+            f'<div style="{_COMPOSE_FONT_STYLE}">{escaped_plain}<br><br></div>'
+        )
         fwd_html_tmp = tempfile.NamedTemporaryFile(
             mode="w",
             suffix=".html",
@@ -1415,6 +1562,18 @@ def forward_email(
                     pb's setString:oldClip forType:(current application's NSPasteboardTypeString)
                 end if
         """
+
+    # If the script fails after the note was put on the clipboard, restore the
+    # user's clipboard before returning. Wrapped in `try` because oldClip is
+    # undefined when the error happens before the paste step (#106).
+    fwd_clipboard_restore_on_error = ""
+    if message:
+        fwd_clipboard_restore_on_error = """try
+                if oldClip is not missing value then
+                    pb's clearContents()
+                    pb's setString:oldClip forType:(current application's NSPasteboardTypeString)
+                end if
+            end try"""
 
     use_frameworks = ""
     if message:
@@ -1521,6 +1680,7 @@ tell application "Mail"
             try
                 {fwd_html_cleanup_script}
             end try
+            {fwd_clipboard_restore_on_error}
             return "Error: " & errMsg
         end try
 
@@ -1531,12 +1691,13 @@ tell application "Mail"
     try:
         if message:
             # Use osascript directly for AppleScriptObjC (use framework) support
-            result = subprocess.run(
-                ["osascript", "-"],
-                input=script.encode("utf-8"),
-                capture_output=True,
-                timeout=30,
-            )
+            with mail_automation_lock():
+                result = subprocess.run(
+                    ["osascript", "-"],
+                    input=script.encode("utf-8"),
+                    capture_output=True,
+                    timeout=30,
+                )
             if result.returncode != 0:
                 stderr = result.stderr.decode("utf-8", errors="replace").strip()
                 return f"Error forwarding email: {stderr}"
@@ -1545,6 +1706,8 @@ tell application "Mail"
             return run_applescript(script)
     except subprocess.TimeoutExpired:
         return "Error: Forward script timed out"
+    except TimeoutError:
+        return MAIL_AUTOMATION_BUSY_ERROR
     finally:
         if fwd_html_temp_path and os.path.exists(fwd_html_temp_path):
             os.unlink(fwd_html_temp_path)
@@ -1719,7 +1882,7 @@ def manage_drafts(
         '''
 
     elif action == "send":
-        if READ_ONLY:
+        if server.READ_ONLY:
             return "Error: Sending drafts is disabled in read-only mode."
         if not draft_subject:
             return "Error: 'draft_subject' is required for sending drafts"

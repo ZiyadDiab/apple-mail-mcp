@@ -433,24 +433,33 @@ def save_draft_via_imap(
     attachments: Optional[List[str]] = None,
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
+    store_account: Optional[str] = None,
+    store_email: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Build a draft and append it to the IMAP Drafts folder with the \\Draft flag.
 
+    With *store_account* and *store_email* the draft keeps *sender_email* as
+    From but is stored in the Drafts of *store_account* (a relay). This serves
+    accounts without IMAP access (e.g. Exchange): Mail picks the sending
+    account from the From address when the draft is opened and sent.
+
     Returns (success, message).
     """
-    if account_config(account) is None:
-        return False, f"Draft-via-IMAP not configured for account: {account}"
+    login_account = store_account or account
+    login_email = store_email or sender_email
+    if account_config(login_account) is None:
+        return False, f"Draft-via-IMAP not configured for account: {login_account}"
 
-    password = _get_keychain_password(account, sender_email)
+    password = _get_keychain_password(login_account, login_email)
     if not password:
         return (
             False,
-            f"No Keychain password for {account} ({sender_email}). "
-            f"Run: security add-generic-password -a {sender_email!r} "
-            f"-s {_keychain_service_name(account)!r} -w",
+            f"No Keychain password for {login_account} ({login_email}). "
+            f"Run: security add-generic-password -a {login_email!r} "
+            f"-s {_keychain_service_name(login_account)!r} -w",
         )
 
-    config = account_config(account)
+    config = account_config(login_account)
 
     try:
         msg = _build_message(
@@ -463,7 +472,7 @@ def save_draft_via_imap(
     try:
         _imap_append(
             config,
-            sender_email,
+            login_email,
             password,
             config.get("drafts_folder"),
             "(\\Draft)",
@@ -482,6 +491,11 @@ def save_draft_via_imap(
         f"To: {to}",
         f"Subject: {subject}",
     ]
+    if store_account and store_account != account:
+        lines.append(
+            f"Stored in: Drafts of {store_account} (open it there and send; "
+            f"Mail sends from {sender_email})"
+        )
     if cc:
         lines.append(f"CC: {cc}")
     if bcc:

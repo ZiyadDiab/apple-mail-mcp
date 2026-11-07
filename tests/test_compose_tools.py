@@ -8,6 +8,18 @@ from unittest.mock import MagicMock, patch
 
 from apple_mail_mcp.tools import compose as compose_tools
 
+_relay_env = patch.dict("os.environ", {"APPLE_MAIL_DRAFT_RELAY": "off"})
+
+
+def setUpModule():
+    # Older tests count AppleScript calls on the editor path; keep the draft
+    # relay out of them. DraftRelayTests set the variable themselves.
+    _relay_env.start()
+
+
+def tearDownModule():
+    _relay_env.stop()
+
 
 def _make_subprocess_result(returncode=0, stdout=b"", stderr=b""):
     """Build a MagicMock shaped like subprocess.CompletedProcess."""
@@ -1491,3 +1503,107 @@ class ComposeFontStyleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DraftRelayTests(unittest.TestCase):
+    """Drafts of accounts without IMAP access go to a relay account's Drafts."""
+
+    def setUp(self):
+        compose_tools._draft_relay_cache = None
+
+    def tearDown(self):
+        compose_tools._draft_relay_cache = None
+
+    def _patches(self, configured, credentials, addresses, accounts):
+        return (
+            patch.object(compose_tools, "account_config",
+                         side_effect=lambda a: {"imap_host": "x"} if a in configured else None),
+            patch.object(compose_tools, "has_smtp_credentials",
+                         side_effect=lambda a, e: a in credentials),
+            patch.object(compose_tools, "_resolve_sender_address",
+                         side_effect=lambda a: addresses.get(a)),
+            patch.object(compose_tools, "_list_account_names", return_value=accounts),
+        )
+
+    def test_compose_draft_without_imap_is_stored_in_relay_with_original_sender(self):
+        p = self._patches(
+            configured={"iCloud"}, credentials={"iCloud"},
+            addresses={"iCloud": "me@icloud.com", "Work": "me@work.com"},
+            accounts=["Work", "iCloud"],
+        )
+        with p[0], p[1], p[2], p[3], patch.object(
+            compose_tools, "save_draft_via_imap", return_value=(True, "SAVED")
+        ) as save, patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("APPLE_MAIL_DRAFT_RELAY", None)
+            result = compose_tools.compose_email(
+                account="Work", to="a@b.com", subject="S", body="B", mode="draft"
+            )
+        self.assertEqual(result, "SAVED")
+        kwargs = save.call_args.kwargs
+        self.assertEqual(kwargs["account"], "Work")
+        self.assertEqual(kwargs["sender_email"], "me@work.com")
+        self.assertEqual(kwargs["store_account"], "iCloud")
+        self.assertEqual(kwargs["store_email"], "me@icloud.com")
+
+    def test_relay_off_falls_back_to_editor_path(self):
+        p = self._patches(
+            configured={"iCloud"}, credentials={"iCloud"},
+            addresses={"iCloud": "me@icloud.com", "Work": "me@work.com"},
+            accounts=["Work", "iCloud"],
+        )
+        with p[0], p[1], p[2], p[3], patch.dict(
+            "os.environ", {"APPLE_MAIL_DRAFT_RELAY": "off"}
+        ):
+            self.assertIsNone(compose_tools._draft_relay("Work"))
+
+    def test_no_account_with_credentials_means_no_relay(self):
+        p = self._patches(
+            configured={"iCloud"}, credentials=set(),
+            addresses={"iCloud": "me@icloud.com"}, accounts=["Work", "iCloud"],
+        )
+        with p[0], p[1], p[2], p[3], patch.dict("os.environ", {"APPLE_MAIL_DRAFT_RELAY": ""}):
+            self.assertIsNone(compose_tools._draft_relay("Work"))
+
+    def test_named_relay_is_used(self):
+        p = self._patches(
+            configured={"iCloud", "Gmail"}, credentials={"iCloud", "Gmail"},
+            addresses={"iCloud": "me@icloud.com", "Gmail": "me@gmail.com"},
+            accounts=["iCloud", "Gmail"],
+        )
+        with p[0], p[1], p[2], p[3], patch.dict("os.environ", {"APPLE_MAIL_DRAFT_RELAY": "Gmail"}):
+            self.assertEqual(compose_tools._draft_relay("Work"), ("Gmail", "me@gmail.com"))
+
+    def test_send_mode_never_uses_relay(self):
+        p = self._patches(
+            configured={"iCloud"}, credentials={"iCloud"},
+            addresses={"iCloud": "me@icloud.com", "Work": "me@work.com"},
+            accounts=["Work", "iCloud"],
+        )
+        with p[0], p[1], p[2], p[3], patch.object(
+            compose_tools, "_save_draft_via_relay"
+        ) as relay, patch.object(compose_tools, "run_applescript", return_value="ok"):
+            compose_tools.compose_email(
+                account="Work", to="a@b.com", subject="S", body="B", mode="send"
+            )
+        relay.assert_not_called()
+
+
+class RelayStorageTests(unittest.TestCase):
+    def test_relay_logs_in_to_store_account_but_keeps_sender_as_from(self):
+        from apple_mail_mcp import smtp_send
+        cfg = {"imap_host": "imap.example", "imap_port": 993, "drafts_folder": "Drafts"}
+        with patch.object(smtp_send, "account_config",
+                          side_effect=lambda a: cfg if a == "iCloud" else None), \
+             patch.object(smtp_send, "_get_keychain_password", return_value="pw") as pw, \
+             patch.object(smtp_send, "_imap_append") as append:
+            ok, msg = smtp_send.save_draft_via_imap(
+                account="Work", sender_email="me@work.com", to="a@b.com",
+                subject="S", plain="B", store_account="iCloud", store_email="me@icloud.com",
+            )
+        self.assertTrue(ok)
+        pw.assert_called_once_with("iCloud", "me@icloud.com")
+        args = append.call_args.args
+        self.assertEqual(args[1], "me@icloud.com")
+        self.assertIn("me@work.com", str(args[5]["From"]))
+        self.assertIn("Stored in: Drafts of iCloud", msg)

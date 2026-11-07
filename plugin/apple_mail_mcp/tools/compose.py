@@ -136,6 +136,69 @@ def _resolve_sender_address(account):
     return sender_address or None
 
 
+# Relay for drafts of accounts without IMAP access (e.g. Exchange). The draft
+# is stored over IMAP in another account's Drafts but keeps the original
+# sender as From; Mail picks the sending account from that address when the
+# draft is opened and sent. This avoids Mail's compose editor, whose
+# share-wrapper renders the body purple on iOS.
+# APPLE_MAIL_DRAFT_RELAY: unset = first account with IMAP credentials,
+# "off" = disabled, otherwise the Mail account name to use.
+_draft_relay_cache = None
+
+
+def _list_account_names():
+    script = '''
+    tell application "Mail"
+        set out to ""
+        repeat with a in every account
+            set out to out & (name of a) & linefeed
+        end repeat
+        return out
+    end tell
+    '''
+    return [n.strip() for n in run_applescript(script).splitlines() if n.strip()]
+
+
+def _draft_relay(exclude_account):
+    """Return (account, address) of an account that can store drafts via IMAP."""
+    global _draft_relay_cache
+    setting = os.environ.get("APPLE_MAIL_DRAFT_RELAY", "").strip()
+    if setting.lower() == "off":
+        return None
+    if _draft_relay_cache and _draft_relay_cache[0] != exclude_account:
+        return _draft_relay_cache
+    candidates = [setting] if setting else _list_account_names()
+    for name in candidates:
+        if name == exclude_account or account_config(name) is None:
+            continue
+        address = _resolve_sender_address(name)
+        if address and has_smtp_credentials(name, address):
+            _draft_relay_cache = (name, address)
+            return _draft_relay_cache
+    return None
+
+
+def _save_draft_via_relay(account, sender_override, **draft):
+    """Store a draft for *account* in a relay account's Drafts.
+
+    Returns the tool message, or None when no relay is available.
+    """
+    relay = _draft_relay(account)
+    if relay is None:
+        return None
+    sender_email = sender_override or _resolve_sender_address(account)
+    if not sender_email:
+        return None
+    ok, msg = save_draft_via_imap(
+        account=account,
+        sender_email=sender_email,
+        store_account=relay[0],
+        store_email=relay[1],
+        **draft,
+    )
+    return msg if ok else f"Error: {msg}"
+
+
 def _validate_from_address(account, from_address):
     """Return (validated_address, error_message) for a sender override.
 
@@ -1288,6 +1351,20 @@ def compose_email(
                     attachments=validated_paths or None,
                 )
             return msg if ok else f"Error: {msg}"
+        if mode == "draft":
+            relayed = _save_draft_via_relay(
+                account,
+                sender_override,
+                to=to,
+                subject=subject,
+                plain=body,
+                html=body_html,
+                cc=cc,
+                bcc=bcc,
+                attachments=validated_paths or None,
+            )
+            if relayed is not None:
+                return relayed
 
     # --- HTML path: use NSPasteboard clipboard injection ---
     if body_html:
@@ -1809,6 +1886,19 @@ def manage_drafts(
                 attachments=None,
             )
             return msg if ok else f"Error: {msg}"
+        relayed = _save_draft_via_relay(
+            account,
+            sender_override,
+            to=to,
+            subject=subject,
+            plain=body,
+            html=None,
+            cc=cc,
+            bcc=bcc,
+            attachments=None,
+        )
+        if relayed is not None:
+            return relayed
 
         escaped_subject = escape_applescript(subject)
         escaped_body = escape_applescript(body)

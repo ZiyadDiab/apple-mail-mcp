@@ -1430,6 +1430,28 @@ class ReplyDraftVerificationTests(unittest.TestCase):
         mock_get_source.assert_not_called()
         self.assertNotIn("Verification", result)
 
+    def test_open_mode_saves_the_reply_to_drafts(self):
+        """Ziyad 23.11.2026: "open" left an unsaved window; closing lost the reply."""
+        with (
+            patch(
+                "apple_mail_mcp.tools.compose.subprocess.run",
+                return_value=_make_subprocess_result(stdout=b"Reply saved to Drafts"),
+            ) as mock_run,
+            patch("apple_mail_mcp.tools.compose.run_applescript"),
+            patch("apple_mail_mcp.tools.compose.get_email_source"),
+        ):
+            compose_tools.reply_to_email(
+                account="Work", subject_keyword="test",
+                reply_body="Yes, 3pm works.", mode="open",
+            )
+        skript = " ".join(
+            (c.kwargs.get("input") or b"").decode() if isinstance(c.kwargs.get("input"), bytes)
+            else str(c.kwargs.get("input") or "")
+            for c in mock_run.call_args_list
+        )
+        self.assertIn("save replyMessage", skript)
+        self.assertNotIn("close window 1", skript)
+
     def test_applescript_error_does_not_attempt_verification(self):
         """If the reply itself failed, there is no saved draft to read back."""
         with (

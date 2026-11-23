@@ -790,7 +790,7 @@ def reply_to_email(
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
         send: If True, send immediately; if False (default), save as draft. Ignored if mode is set.
-        mode: Delivery mode — "draft" (save silently, default behavior when send=False), "send" (send immediately), or "open" (save to Drafts AND open the compose window for review; closing the window keeps the draft). Overrides send parameter when set.
+        mode: Delivery mode — "draft" (save silently, default behavior when send=False), "send" (send immediately), or "open" (same as "draft": saved to Drafts, window closed; no window is ever left open). Overrides send parameter when set.
         attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the reply is pasted as HTML. The plain 'reply_body' field is still required as fallback text.
         from_address: Optional sender address to use for this reply. Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
@@ -807,11 +807,16 @@ def reply_to_email(
         effective_mode = mode
     else:
         effective_mode = "send" if send else "draft"
+    if effective_mode == "open":
+        # "open" never leaves a window open (Ziyad 23.11.2026): the draft is
+        # saved and its window closed, exactly like "draft". To read it, the
+        # user opens it from Drafts himself.
+        effective_mode = "draft"
 
     if server.READ_ONLY and effective_mode == "send":
         return (
             "Error: Sending is disabled in read-only mode. "
-            'Use mode="draft" to save the reply, or mode="open" to review it in Mail.'
+            'Use mode="draft" to save the reply, then open it from Drafts.'
         )
 
     reply_body = _strip_cdata_wrappers(reply_body) or ""
@@ -826,9 +831,7 @@ def reply_to_email(
     # threading headers. Only "send"/"draft" (not "open", which needs the UI) and
     # plain-text replies; HTML replies fall through to the GUI path below. Any
     # failure also falls through, so the legacy path stays as a safety net.
-    _effective_mode = (
-        mode if mode in ("send", "draft", "open") else ("send" if send else "draft")
-    )
+    _effective_mode = effective_mode
     if _effective_mode in ("send", "draft") and not body_html:
         _sender_email = (
             (sender_override or _resolve_sender_address(account))
@@ -965,20 +968,6 @@ def reply_to_email(
                     send replyMessage
                 end tell"""
         success_text = "Reply sent successfully!"
-    elif effective_mode == "open":
-        header_text = "OPENING REPLY FOR REVIEW"
-        # Nothing follows the paste in open mode, so the clipboard restore
-        # would run only 0.5s after Cmd+V. Wait as long as send/draft do
-        # before restoring, so a slow paste can't pick up the restored
-        # clipboard instead of the reply body (#106).
-        # Save right after the paste so the reply is in Drafts even if the
-        # window is closed or Mail quits. "Open" without a save left a window
-        # that existed nowhere else (Ziyad 23.11.2026).
-        post_paste_action = """
-                delay 0.8
-                save replyMessage"""
-        success_text = ("Reply saved to Drafts and opened in Mail for review. "
-                        "Edit and send when ready.")
     else:  # draft
         header_text = "SAVING REPLY AS DRAFT"
         # Explicit save first, then close. The previous `close window 1 saving yes`
@@ -1279,7 +1268,7 @@ def compose_email(
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
         attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
-        mode: Delivery mode — "draft" (save silently to Drafts, default; safe for AI-initiated sends), "send" (send immediately, requires explicit opt-in), or "open" (save to Drafts AND open the compose window for review before sending)
+        mode: Delivery mode — "draft" (save silently to Drafts, default; safe for AI-initiated sends), "send" (send immediately, requires explicit opt-in), or "open" (same as "draft": saved to Drafts, window closed)
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the email is sent as HTML. The plain 'body' field is still required as fallback text.
         from_address: Optional sender address to use for this message. Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
 
@@ -1290,11 +1279,16 @@ def compose_email(
     # Validate mode
     if mode not in ("send", "draft", "open"):
         return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
+    if mode == "open":
+        # "open" never leaves a window open (Ziyad 23.11.2026): the draft is
+        # saved and its window closed, exactly like "draft". To read it, the
+        # user opens it from Drafts himself.
+        mode = "draft"
 
     if server.READ_ONLY and mode == "send":
         return (
             "Error: Sending is disabled in read-only mode. "
-            'Use mode="draft" to save the message, or mode="open" to review it in Mail.'
+            'Use mode="draft" to save the message, then open it from Drafts.'
         )
 
     body = _strip_cdata_wrappers(body) or ""
@@ -1438,13 +1432,6 @@ def compose_email(
         visible = "false"
         send_command = "send newMessage"
         success_text = "✓ Email sent successfully!"
-    elif mode == "open":
-        header_text = "OPENING EMAIL FOR REVIEW"
-        visible = "true"
-        # Saved to Drafts first, then shown (see the reply "open" mode).
-        send_command = "save newMessage\n            activate"
-        success_text = ("✓ Email saved to Drafts and opened in Mail for review. "
-                        "Edit and send when ready.")
     else:  # draft
         header_text = "SAVING EMAIL AS DRAFT"
         visible = "false"
@@ -1537,7 +1524,7 @@ def forward_email(
         mailbox: Mailbox to search in (default: "INBOX")
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
-        mode: Delivery mode — "draft" (save silently to Drafts, default), "send" (send immediately, requires explicit opt-in), or "open" (leave compose window open for review)
+        mode: Delivery mode — "draft" (save silently to Drafts, default), "send" (send immediately, requires explicit opt-in), or "open" (same as "draft": saved to Drafts, window closed)
         from_address: Optional sender address to use when forwarding. Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
 
     Returns:
@@ -1547,6 +1534,11 @@ def forward_email(
     # Validate mode
     if mode not in ("send", "draft", "open"):
         return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
+    if mode == "open":
+        # "open" never leaves a window open (Ziyad 23.11.2026): the draft is
+        # saved and its window closed, exactly like "draft". To read it, the
+        # user opens it from Drafts himself.
+        mode = "draft"
 
     # forward_email is removed from the tool list under --read-only; this
     # guard keeps it safe even if that removal ever fails.
@@ -1670,7 +1662,7 @@ use scripting additions
     if mode == "send":
         fwd_dispatch_script = "send forwardMessage"
         fwd_success_text = "Email forwarded successfully."
-    elif mode == "draft":
+    else:  # draft ("open" was mapped to draft above)
         fwd_dispatch_script = (
             "delay 0.5\n"
             "                save forwardMessage\n"
@@ -1678,11 +1670,6 @@ use scripting additions
             "                close window 1"
         )
         fwd_success_text = "Forward saved as draft."
-    else:  # open
-        # Saved to Drafts, window stays open for review (see reply "open").
-        fwd_dispatch_script = "delay 0.5\n                save forwardMessage"
-        fwd_success_text = ("Forward saved to Drafts and opened in Mail for review. "
-                            "Edit and send when ready.")
 
     script = f'''{use_frameworks}
 tell application "Mail"
